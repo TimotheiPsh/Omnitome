@@ -84,35 +84,40 @@ class AttributionArbiter {
       weights: cTop3Weights,
     };
 
-    // Helper to fire Signal B
+    // Candidate retrieval is not successful verification. Keep candidate IDs for
+    // diagnostics, but never expose a skipped/failed arbitration as grounded.
+    const unverified = (reason) => ({
+      method: 'unverified',
+      confidence: 'none',
+      grounded: false,
+      chunk_ids: cAnswer.chunk_ids,
+      weights: cAnswer.weights,
+      fell_back: true,
+      fallback_reason: reason,
+    });
+
     const fireSignalB = async (methodName, confidenceLevel) => {
-      if (options.fast) {
-        // Fast test mode skips LLM arbitration and falls back cleanly to C
-        return {
-          method: methodName,
-          confidence: confidenceLevel,
-          grounded: true,
-          chunk_ids: cAnswer.chunk_ids,
-          weights: cAnswer.weights,
-          fell_back: true,
-          fallback_reason: 'fast_path_bypass',
-        };
-      }
+      if (options.fast) return unverified('fast_path_bypass');
 
       try {
         const bResult = await this.callSignalB(paragraph, candidateChunks, C_signal, options);
         if (bResult && Array.isArray(bResult.chunk_ids) && bResult.chunk_ids.length > 0) {
           // Filter to valid chunks only
-          const validBChunks = bResult.chunk_ids.filter((cid) => sourceChunkIdSet.has(cid));
+          const validBChunks = [...new Set(bResult.chunk_ids.filter((cid) => sourceChunkIdSet.has(cid)))];
           if (validBChunks.length > 0) {
-            // Re-normalize weights
+            // Explicit invalid weights must not turn into verified evidence.
+            const suppliedWeights = validBChunks.map((cid) => bResult.weights?.[cid]);
+            if (suppliedWeights.some((w) => w !== undefined &&
+              (typeof w !== 'number' || !Number.isFinite(w) || w < 0))) {
+              return unverified('arbiter_invalid_weights');
+            }
             const normWeights = {};
             let sumWeights = 0;
             for (const cid of validBChunks) {
               const w = typeof bResult.weights?.[cid] === 'number' ? bResult.weights[cid] : 1.0;
               sumWeights += w;
             }
-            if (sumWeights <= 0) sumWeights = 1.0;
+            if (!Number.isFinite(sumWeights) || sumWeights <= 0) return unverified('arbiter_invalid_weights');
             for (const cid of validBChunks) {
               const w = typeof bResult.weights?.[cid] === 'number' ? bResult.weights[cid] : 1.0;
               normWeights[cid] = Number((w / sumWeights).toFixed(4));
@@ -129,26 +134,9 @@ class AttributionArbiter {
             };
           }
         }
-        // If B returned no valid chunks, fall back to C
-        return {
-          method: methodName,
-          confidence: confidenceLevel,
-          grounded: true,
-          chunk_ids: cAnswer.chunk_ids,
-          weights: cAnswer.weights,
-          fell_back: true,
-          fallback_reason: 'arbiter_unavailable',
-        };
+        return unverified('arbiter_no_valid_sources');
       } catch (err) {
-        return {
-          method: methodName,
-          confidence: confidenceLevel,
-          grounded: true,
-          chunk_ids: cAnswer.chunk_ids,
-          weights: cAnswer.weights,
-          fell_back: true,
-          fallback_reason: 'arbiter_unavailable',
-        };
+        return unverified('arbiter_unavailable');
       }
     };
 
@@ -217,7 +205,7 @@ class AttributionArbiter {
 
     const prompt = `You are an expert reading provenance arbiter.
 Given a compressed Smart paragraph and candidate source passages from the original book, identify which source chunk(s) substantiate the factual claims in the paragraph.
-Output valid JSON only with chunk_ids and normalized weights (summing to 1.0). Limit to max 2-3 chunk_ids.
+Output valid JSON only with chunk_ids and normalized weights (summing to 1.0). Limit to max 2-3 chunk_ids. If none substantiate the claims, return {"chunk_ids": [], "weights": {}}.
 
 SMART PARAGRAPH:
 ${paragraph}
@@ -232,15 +220,16 @@ OUTPUT JSON ONLY:
 }`;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
+      let timeoutId;
       try {
         const provider = aiService.getActiveProvider();
         const health = await provider.checkHealth();
         if (!health || !health.available) break;
 
         const timeoutMs = options.timeout || 15000;
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Signal B timeout')), timeoutMs)
-        );
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error('Signal B timeout')), timeoutMs);
+        });
 
         const response = await Promise.race([
           aiService.generateText(prompt, {
@@ -254,11 +243,13 @@ OUTPUT JSON ONLY:
         const raw = (response && response.text) || '';
         const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
         const parsed = JSON.parse(cleaned);
-        if (parsed && Array.isArray(parsed.chunk_ids) && parsed.chunk_ids.length > 0) {
+        if (parsed && Array.isArray(parsed.chunk_ids)) {
           return parsed;
         }
       } catch (err) {
         if (attempt === 2) throw err;
+      } finally {
+        clearTimeout(timeoutId);
       }
     }
 

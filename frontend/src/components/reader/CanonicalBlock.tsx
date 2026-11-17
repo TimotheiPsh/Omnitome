@@ -311,6 +311,11 @@ function CanonicalParagraph({
           data-tts-active={isParagraphTtsActive ? 'true' : 'false'}
           data-source-page={block.sourcePage !== undefined ? block.sourcePage : undefined}
         >
+          {provenanceRow?.method === 'unverified' && (
+            <span className="block text-caption text-ink-muted italic">
+              Source verification incomplete.
+            </span>
+          )}
           {sentences.map((sent, sIdx) => {
             const globalIdx = sentenceOffset + sIdx;
             const isTtsCurrent = activeSentenceIndex === globalIdx;

@@ -8,6 +8,7 @@
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
     "test": "node scripts/run-all-tests.js",
+    "test:provenance": "node --test backend/tests/provenance_fallback_cjk_test.js",
     "db:reset": "node -e \"require('./backend/db/database').resetAndSeedDatabase(); console.log('Database reset and seeded successfully.');\"",
     "db:seed": "node -e \"require('./backend/db/database').resetAndSeedDatabase(); console.log('Database reset and seeded successfully.');\"",
     "tauri:dev": "tauri dev",

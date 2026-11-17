@@ -13,7 +13,7 @@ const attributionRepository = require('../../repositories/attributionRepository'
  * initials, and boundary punctuation without swallowing sentence-ending single-letter variables
  * (e.g. math clauses) or terminal abbreviations (e.g. etc.).
  */
-function splitIntoSentences(text) {
+function splitIntoSentences(text, legacy = false) {
   if (!text || typeof text !== 'string') return [];
   const cleaned = text.replace(/\s*\[Source\s+\d+\]/gi, '').trim();
   if (!cleaned) return [];
@@ -28,20 +28,24 @@ function splitIntoSentences(text) {
   let start = 0;
   for (let i = 0; i < cleaned.length; i++) {
     const ch = cleaned[i];
-    if (ch !== '.' && ch !== '!' && ch !== '?') continue;
+    if (!(legacy ? /[.!?]/ : /[.!?。！？]/u).test(ch)) continue;
+    const isCjkBoundary = !legacy && /[。！？]/u.test(ch);
 
     let j = i + 1;
-    while (j < cleaned.length && /[.!?]/.test(cleaned[j])) j++;
+    while (j < cleaned.length && (legacy ? /[.!?]/ : /[.!?。！？]/u).test(cleaned[j])) j++;
+    // Keep closing punctuation with its sentence (including Japanese quotes).
+    while (!legacy && j < cleaned.length && /["'”’」』）)]/u.test(cleaned[j])) j++;
 
     if (j >= cleaned.length) break;
-    if (!/\s/.test(cleaned[j])) { i = j - 1; continue; }
+    if (!isCjkBoundary && !/\s/.test(cleaned[j])) { i = j - 1; continue; }
 
     let k = j;
     while (k < cleaned.length && /\s/.test(cleaned[k])) k++;
     if (k >= cleaned.length) break;
 
     const next = cleaned[k];
-    if (!/[A-Z0-9"'([]/.test(next)) { i = j - 1; continue; }
+    if (legacy && !/[A-Z0-9"'([]/.test(next)) { i = j - 1; continue; }
+    if (!legacy && !isCjkBoundary && !/[A-Z0-9"'([“‘「『\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(next)) { i = j - 1; continue; }
 
     const before = cleaned.slice(0, i);
     const lastSpace = Math.max(
@@ -51,9 +55,9 @@ function splitIntoSentences(text) {
     );
     const token = (lastSpace >= 0 ? before.slice(lastSpace + 1) : before).toLowerCase();
 
-    if (STRONG_ABBREVIATIONS.has(token + '.')) { i = j - 1; continue; }
+    if ((legacy || ch === '.') && STRONG_ABBREVIATIONS.has(token + '.')) { i = j - 1; continue; }
 
-    if (/^[a-z]$/.test(token)) {
+    if ((legacy || ch === '.') && /^[a-z]$/.test(token)) {
       const prev = lastSpace >= 0 ? before.slice(0, lastSpace).trim() : '';
       const prevWord = (prev.split(/\s+/).pop() || '').toLowerCase();
       const isPrevInitial = /^[a-z]\.$/.test(prevWord) && !STRONG_ABBREVIATIONS.has(prevWord);
@@ -96,6 +100,21 @@ function haveSameChunks(arr1, arr2) {
 }
 
 class ProvenanceResolver {
+  // Stored sentence indices are meaningful only for the splitter that produced them.
+  // Preserve unaffected legacy rows; hide affected links until explicit re-verification.
+  protectLegacySegments(rows, rep) {
+    const paragraphs = (rep?.content || '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+    return rows.map(row => {
+      const version = row.weights?.sentence_splitter_version ?? row.weights_json?.sentence_splitter_version;
+      if (version === 2 || row.grounded === false || !row.segments?.length) return row;
+      const text = paragraphs[row.paragraph_index];
+      if (text !== undefined && JSON.stringify(splitIntoSentences(text, true)) ===
+        JSON.stringify(splitIntoSentences(text))) return row;
+      return { ...row, segments: [], grounded: false, method: 'unverified', confidence: 'none',
+        fell_back: true, fallback_reason: 'sentence_boundaries_changed' };
+    });
+  }
+
   /**
    * Resolve paragraph-level provenance and sentence-level segmentation for an EDITORIAL_SYNTHESIS representation
    *
@@ -135,7 +154,7 @@ class ProvenanceResolver {
       return {
         representation_id: representationId,
         verified_at: existing[0].verified_at,
-        paragraphs: existing,
+        paragraphs: this.protectLegacySegments(existing, rep),
       };
     }
 
@@ -291,7 +310,7 @@ class ProvenanceResolver {
           (attributionStage === 'reranker' || attributionStage === 'centroid') &&
           Object.keys(rerankerScores).length > 0;
 
-        if (hasRerankerSignal) {
+        if (arbiterResult.grounded && hasRerankerSignal) {
           let anchorId = null;
           let anchorScore = -Infinity;
           for (const [cid, score] of Object.entries(rerankerScores)) {
@@ -317,7 +336,7 @@ class ProvenanceResolver {
             chunk_ids: finalChunkIds,
             confidence: paraConfidence,
           });
-        } else if (sentences.length > 0 && resolvedChunkIds.length > 0) {
+        } else if (arbiterResult.grounded && sentences.length > 0 && resolvedChunkIds.length > 0) {
           if (resolvedChunkIds.length === 1) {
             // Entire paragraph maps to single chunk
             segments.push({
@@ -409,7 +428,7 @@ class ProvenanceResolver {
           segments,
           source_chunk_ids: arbiterResult.chunk_ids,
           weights: arbiterResult.weights,
-          weights_json: A_claim?.weights_json || { attribution_stage: 'legacy' },
+          weights_json: { ...(A_claim?.weights_json || { attribution_stage: 'legacy' }), sentence_splitter_version: 2 },
           method: arbiterResult.method,
           confidence: arbiterResult.confidence,
           grounded: arbiterResult.grounded,
@@ -502,7 +521,7 @@ class ProvenanceResolver {
    * @returns {object}
    */
   getProvenance(representationId) {
-    const rows = attributionRepository.getBySmartChapterId(representationId);
+    let rows = attributionRepository.getBySmartChapterId(representationId);
     if (!rows || rows.length === 0) {
       return {
         smart_chapter_id: representationId,
@@ -512,6 +531,10 @@ class ProvenanceResolver {
       };
     }
 
+    if (rows.some(row => row.grounded !== false && row.segments?.length && row.weights?.sentence_splitter_version !== 2)) {
+      const rep = smartChapterRepository.getById(representationId) || chapterRepository.getRepresentationById(representationId);
+      rows = this.protectLegacySegments(rows, rep);
+    }
     return {
       smart_chapter_id: representationId,
       representation_id: representationId,
@@ -524,6 +547,8 @@ class ProvenanceResolver {
         method: r.method,
         confidence: r.confidence,
         grounded: r.grounded,
+        fell_back: r.fell_back,
+        fallback_reason: r.fallback_reason,
       })),
     };
   }

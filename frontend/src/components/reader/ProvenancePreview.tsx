@@ -174,7 +174,9 @@ export function ProvenancePreview({
       {isUngrounded && (
         <div className="py-2">
           <p className="text-caption text-ink-muted italic mb-0">
-            No traced source for this paragraph.
+            {provenanceRow?.method === 'unverified'
+              ? 'Source verification incomplete. Candidate passages are not verified evidence.'
+              : 'No traced source for this paragraph.'}
           </p>
         </div>
       )}

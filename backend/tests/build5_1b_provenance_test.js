@@ -106,10 +106,11 @@ async function runTests() {
       options: { fast: true },
     });
 
-    assert.strictEqual(res.method, 'b_arbitrated');
-    assert.strictEqual(res.confidence, 'medium');
-    assert.strictEqual(res.grounded, true);
-    console.log('  ✓ Test 3: Medium C with conflicting Signal A triggers Signal B arbitration.');
+    assert.strictEqual(res.method, 'unverified');
+    assert.strictEqual(res.confidence, 'none');
+    assert.strictEqual(res.grounded, false);
+    assert.strictEqual(res.fallback_reason, 'fast_path_bypass');
+    console.log('  ✓ Test 3: Medium C with conflicting Signal A remains unverified when arbitration is skipped.');
   }
 
   // --------------------------------------------------------------------------
@@ -131,10 +132,11 @@ async function runTests() {
       options: { fast: true },
     });
 
-    assert.strictEqual(res.method, 'b_weak_c');
-    assert.strictEqual(res.confidence, 'low');
-    assert.strictEqual(res.grounded, true);
-    console.log('  ✓ Test 4: Low C similarity triggers b_weak_c with low confidence.');
+    assert.strictEqual(res.method, 'unverified');
+    assert.strictEqual(res.confidence, 'none');
+    assert.strictEqual(res.grounded, false);
+    assert.strictEqual(res.fallback_reason, 'fast_path_bypass');
+    console.log('  ✓ Test 4: Low C similarity remains unverified when arbitration is skipped.');
   }
 
   // --------------------------------------------------------------------------
@@ -357,6 +359,8 @@ async function runTests() {
     const smartId = `smart-test-t8-${Date.now()}`;
     const origSim = embeddingService.cosineSimilarity;
     const origEmbed = embeddingService.embedText;
+    const origSignalB = attributionArbiter.callSignalB;
+    let signalBCalls = 0;
 
     try {
       bookRepository.create({ id: bookId, title: 'Multi-Chunk Test Book', content_type: 'technical' });
@@ -409,8 +413,17 @@ async function runTests() {
         return 0.5;
       };
 
-      const result = await provenanceResolver.verifyRepresentation(smartId, { fast: true, force: true });
+      // A close C margin requires arbitration. Mock verified support instead of
+      // treating the fast-path candidate fallback as grounded evidence.
+      attributionArbiter.callSignalB = async () => {
+        signalBCalls += 1;
+        return { chunk_ids: [c1.id, c2.id], weights: { [c1.id]: 0.55, [c2.id]: 0.45 } };
+      };
+      const result = await provenanceResolver.verifyRepresentation(smartId, { fast: false, force: true });
+      assert.strictEqual(signalBCalls, 1, 'Multi-chunk case must exercise Signal B');
       assert.strictEqual(result.paragraphs.length, 1);
+      assert.strictEqual(result.paragraphs[0].grounded, true, 'Mock arbitration must verify support');
+      assert.strictEqual(result.paragraphs[0].method, 'b_arbitrated');
       const segs = result.paragraphs[0].segments;
       assert(segs.length >= 1, 'Must have at least 1 segment');
       assert.strictEqual(segs[0].chunk_id, c1.id, 'Primary chunk must be best match');
@@ -419,6 +432,7 @@ async function runTests() {
       assert(segs[0].chunk_ids.includes(c1.id) && segs[0].chunk_ids.includes(c2.id));
       console.log('  ✓ Multi-chunk inclusion at Δ ≤ 0.08 verified: both chunks included in segment.chunk_ids.');
     } finally {
+      attributionArbiter.callSignalB = origSignalB;
       embeddingService.cosineSimilarity = origSim;
       embeddingService.embedText = origEmbed;
       attributionRepository.deleteByRepresentationId(smartId);

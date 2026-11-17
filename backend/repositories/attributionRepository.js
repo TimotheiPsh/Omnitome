@@ -162,16 +162,20 @@ class AttributionRepository {
       reranker_scores = {};
     }
 
+    // Normalize historical fallback rows without rewriting the user's database.
+    const unverified = row.method === 'unverified' || (Boolean(row.fell_back) &&
+      ['arbiter_unavailable', 'arbiter_no_valid_sources', 'arbiter_invalid_weights', 'fast_path_bypass'].includes(row.fallback_reason));
+
     return {
       id: row.id,
       smart_chapter_id: row.smart_chapter_id,
       paragraph_index: row.paragraph_index,
-      segments,
+      segments: unverified ? [] : segments,
       source_chunk_ids: sourceChunkIds,
       weights,
-      method: row.method,
-      confidence: row.confidence,
-      grounded: Boolean(row.grounded),
+      method: unverified ? 'unverified' : row.method,
+      confidence: unverified ? 'none' : row.confidence,
+      grounded: !unverified && Boolean(row.grounded),
       verified_at: row.verified_at,
       fell_back: Boolean(row.fell_back),
       fallback_reason: row.fallback_reason || null,

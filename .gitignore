@@ -105,3 +105,4 @@ docs/launch/
 # Agent configurations & workspace skills
 .agents/
 .claude/
+skills-lock.json

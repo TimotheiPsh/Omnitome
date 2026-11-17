@@ -103,14 +103,28 @@ class AttributionArbiter {
         const bResult = await this.callSignalB(paragraph, candidateChunks, C_signal, options);
         if (bResult && Array.isArray(bResult.chunk_ids) && bResult.chunk_ids.length > 0) {
           // Filter to valid chunks only
-          const validBChunks = [...new Set(bResult.chunk_ids.filter((cid) => sourceChunkIdSet.has(cid)))];
-          if (validBChunks.length > 0) {
+          const rawBChunks = [...new Set(bResult.chunk_ids.filter((cid) => sourceChunkIdSet.has(cid)))];
+          if (rawBChunks.length > 0) {
             // Explicit invalid weights must not turn into verified evidence.
-            const suppliedWeights = validBChunks.map((cid) => bResult.weights?.[cid]);
+            const suppliedWeights = rawBChunks.map((cid) => bResult.weights?.[cid]);
             if (suppliedWeights.some((w) => w !== undefined &&
               (typeof w !== 'number' || !Number.isFinite(w) || w < 0))) {
               return unverified('arbiter_invalid_weights');
             }
+
+            // Prune zero-weight or non-positive candidate chunks
+            const validBChunks = rawBChunks.filter((cid) => {
+              const w = bResult.weights?.[cid];
+              return w === undefined || w > 0;
+            });
+
+            if (validBChunks.length === 0) {
+              if (suppliedWeights.some((w) => w !== undefined)) {
+                return unverified('arbiter_invalid_weights');
+              }
+              return unverified('arbiter_no_valid_sources');
+            }
+
             const normWeights = {};
             let sumWeights = 0;
             for (const cid of validBChunks) {

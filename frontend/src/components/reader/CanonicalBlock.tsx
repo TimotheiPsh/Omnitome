@@ -323,9 +323,9 @@ function CanonicalParagraph({
               <React.Fragment key={sIdx}>
                 <span
                   data-sentence-index={globalIdx}
-                  className={`sentence-span ${isTtsCurrent ? 'tts-active' : ''} ${
-                    onSentenceClick ? 'cursor-pointer' : ''
-                  }`.trim()}
+                  className={`sentence-span text-ink-muted underline decoration-dotted decoration-ink-muted/50 ${
+                    isTtsCurrent ? 'tts-active' : ''
+                  } ${onSentenceClick ? 'cursor-pointer' : ''}`.trim()}
                   onClick={() => onSentenceClick?.(globalIdx)}
                 >
                   {renderInlineText(sent)}

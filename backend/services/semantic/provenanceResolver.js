@@ -364,10 +364,12 @@ class ProvenanceResolver {
             // Map each sentence to qualifying chunks within MULTI_CHUNK_DELTA_THRESHOLD
             const resolvedChunks = candidateChunks.filter((c) => resolvedChunkIds.includes(c.id));
             const sentenceAttributions = [];
+            const sentVectors = typeof embeddingService.embedTexts === 'function'
+              ? await embeddingService.embedTexts(sentences)
+              : await Promise.all(sentences.map((sentText) => embeddingService.embedText(sentText)));
 
             for (let sIdx = 0; sIdx < sentences.length; sIdx++) {
-              const sentText = sentences[sIdx];
-              const sentVec = await embeddingService.embedText(sentText);
+              const sentVec = sentVectors[sIdx];
               const chunkScores = [];
 
               for (const ch of resolvedChunks) {

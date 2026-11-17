@@ -1,0 +1,20 @@
+1
+00:00:00,300 --> 00:00:10,591
+Most AI tools throw away your books to give you a vague summary that discards 85% of technical depth and hallucinates facts.
+
+2
+00:00:11,000 --> 00:00:23,011
+Omnitome does not summarize. It compresses. Every chapter is densified seven-to-one—and every single sentence carries clickable citations linking directly back to verbatim source text.
+
+3
+00:00:23,500 --> 00:00:36,231
+Completely local-first with zero cloud egress. Orchestrated with Tauri v2, an await barrier that locks RAM under 300 megabytes, and PyTorch that reclaims over 3 gigabytes of VRAM.
+
+4
+00:00:36,700 --> 00:00:46,551
+Listen offline with gapless, studio-grade Kokoro neural audio, paired with tactile acoustic soundscapes and five focus themes.
+
+5
+00:00:47,200 --> 00:00:58,211
+Omnitome version 1.1 is free, open-source, and live on Product Hunt today for Windows. Experience verifiable reading.
+

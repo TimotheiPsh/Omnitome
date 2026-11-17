@@ -4,13 +4,20 @@
 
 <h1 align="center">Omnitome</h1>
 
-### 🎬 [Watch the 3-Minute Showcase Video](https://youtu.be/Nmb-qiZpnrk)
+<p align="center">
+  <a href="https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social" target="_blank">
+    <img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1312875&theme=neutral" alt="Omnitome - Read 500-page books faster—with clickable source proof. | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" />
+  </a>
+</p>
+
+### 🎬 [Watch the 3-Minute Showcase Video](https://youtu.be/Nmb-qiZpnrk) • 🚀 [Live on Product Hunt](https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social)
 
 <p align="center">
   <strong>A Local-First Neural Reading System with Loss-Bounded Semantic Compression, Deterministic Vector Provenance, and On-Device Speech Synthesis.</strong>
 </p>
 
 <p align="center">
+  <a href="https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social"><img src="https://img.shields.io/badge/Product_Hunt-Live_Now-FF6154?style=for-the-badge&logo=producthunt&logoColor=white" alt="Live on Product Hunt" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
   <img src="https://img.shields.io/badge/Release-v1.1.1%20Stable-0052CC" alt="Release: v1.1.1 Stable" />
   <img src="https://img.shields.io/badge/Platform-Windows%20x64%20(Native%20Tier%201)-lightgrey" alt="Platform: Windows x64" />
@@ -31,6 +38,9 @@
 </p>
 
 <p align="center">
+  <a href="https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social">
+    <img src="https://img.shields.io/badge/🚀_Support_on_Product_Hunt-Live_Now-FF6154?style=for-the-badge&logo=producthunt&logoColor=white" alt="Product Hunt Launch" />
+  </a>
   <a href="https://github.com/ayumu-ml/Omnitome/releases/latest">
     <img src="https://img.shields.io/badge/⚡_Download_Omnitome_v1.1.1-Windows_x64_(1.95_GB)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download Omnitome v1.1.1 for Windows" />
   </a>
@@ -40,9 +50,13 @@
   <a href="https://youtu.be/Nmb-qiZpnrk">
     <img src="https://img.shields.io/badge/🎬_Watch_Demo-3:44_Master_Walkthrough-E0245E?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch Demo" />
   </a>
+  <a href="assets/omnitome_showcase_60s.mp4">
+    <img src="https://img.shields.io/badge/⚡_60s_Showcase-Gemini_Kore_VA-8A2BE2?style=for-the-badge&logo=quicktime&logoColor=white" alt="60s Showcase Video" />
+  </a>
 </p>
 
 <p align="center">
+  <a href="https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social">🚀 Product Hunt Live</a> •
   <a href="#-quick-tour-interactive-visual-guide">🎬 Visual Guide</a> •
   <a href="#-why-omnitome">✨ Why Omnitome</a> •
   <a href="#-quick-start-3-minutes-to-reading">🚀 Quick Start</a> •
@@ -63,7 +77,11 @@
 
 Omnitome combines **loss-bounded semantic compression (~7:1)** with **100% deterministic attribution**. Experience the core reading workflows below:
 
-> 📺 **Prefer video walkthrough?** Watch the complete **[3:44 Master Walkthrough Video on YouTube](https://youtu.be/Nmb-qiZpnrk)**, or check the compact [60-Second Demo (`assets/omnitome_demo_60s.mp4`)](assets/omnitome_demo_60s.mp4).
+> 🚀 **Omnitome is currently LIVE on Product Hunt!** [Support our launch on Product Hunt](https://www.producthunt.com/products/omnitome?utm_source=other&utm_medium=social) and join the community discussion.
+>
+> 📺 **Watch the Walkthroughs:**
+> - **[3:44 Master Walkthrough Video on YouTube](https://youtu.be/Nmb-qiZpnrk)** *(Comprehensive system design & architectural deep-dive)*
+> - **[New 60-Second Showcase (`assets/omnitome_showcase_60s.mp4`)](assets/omnitome_showcase_60s.mp4)** *(Featuring Gemini 2.5 Flash Kore TTS voice acting, millisecond SRT subtitles, & 50ms raised-cosine DSP ducking)*
 
 ---
 

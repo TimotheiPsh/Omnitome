@@ -139,7 +139,7 @@ class AINormalizer {
       // 7. Markdown Table (| Header 1 | Header 2 |)
       if (trimmed.includes('|') && i + 1 < lines.length) {
         const nextTrimmed = lines[i + 1].trim();
-        if (/^\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?$/.test(nextTrimmed)) {
+        if (this.isTableDelimiter(nextTrimmed)) {
           const headers = this.parseTableRow(trimmed);
           const alignments = this.parseTableAlign(nextTrimmed, headers.length);
           const rows = [];
@@ -208,7 +208,7 @@ class AINormalizer {
         !/^(?:[-*+]|•|⁃|‣)\s+/.test(lines[i].trim()) &&
         !/^\d+\.\s+/.test(lines[i].trim()) &&
         !/^(?:[-*_]\s*){3,}$/.test(lines[i].trim()) &&
-        !(lines[i].trim().includes('|') && i + 1 < lines.length && /^\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?$/.test(lines[i + 1].trim()))
+        !(lines[i].trim().includes('|') && i + 1 < lines.length && this.isTableDelimiter(lines[i + 1].trim()))
       ) {
         paraLines.push(lines[i].trim());
         i++;
@@ -310,6 +310,33 @@ class AINormalizer {
    */
   formatInlineMarkdown(str) {
     return this.cleanInlineText(str);
+  }
+
+  /**
+   * Deterministic linear validator for Markdown table delimiter rows (e.g. |:---|:---:|).
+   * Replaces polynomial/exponential regexes to eliminate ReDoS.
+   */
+  isTableDelimiter(line) {
+    if (!line || typeof line !== 'string') return false;
+    const trimmed = line.trim();
+    if (!trimmed.includes('-')) return false;
+
+    let s = trimmed;
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|')) s = s.slice(0, -1);
+    s = s.trim();
+    if (!s) return false;
+
+    const cells = s.split('|');
+    if (cells.length === 0) return false;
+
+    for (const cell of cells) {
+      const c = cell.trim();
+      if (!/^:?-+:?$/.test(c)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   parseTableRow(line) {

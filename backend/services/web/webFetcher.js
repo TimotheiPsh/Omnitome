@@ -6,6 +6,8 @@
 
 'use strict';
 
+const dns = require('node:dns');
+
 /**
  * Validates whether an IPv4 address string belongs to private, loopback, link-local,
  * or reserved blocks.
@@ -128,6 +130,43 @@ function isRestrictedHost(rawHostname) {
   return false;
 }
 
+/**
+ * Resolves a hostname via DNS and verifies that none of its resolved addresses
+ * point to loopback, private, link-local, or cloud metadata ranges.
+ * Protects against DNS rebinding and wildcard domain SSRF.
+ *
+ * @param {string} hostname
+ * @returns {Promise<void>}
+ */
+async function validateHostnameDns(hostname) {
+  if (!hostname || typeof hostname !== 'string') return;
+  // If hostname is already a literal IP, isRestrictedHost/isRestrictedIpv4 already evaluated it
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname) || hostname.includes(':')) {
+    return;
+  }
+
+  let addresses;
+  try {
+    addresses = await dns.promises.lookup(hostname, { all: true });
+  } catch {
+    // If DNS resolution fails here, let subsequent fetch() handle connection/lookup failure
+    return;
+  }
+
+  for (const record of addresses) {
+    const ip = record.address;
+    if (record.family === 4) {
+      if (isRestrictedIpv4(ip)) {
+        throw new Error(`Access to hostname "${hostname}" is restricted because it resolves to private/local network address "${ip}".`);
+      }
+    } else if (record.family === 6) {
+      if (isRestrictedHost(ip)) {
+        throw new Error(`Access to hostname "${hostname}" is restricted because it resolves to private/local network address "${ip}".`);
+      }
+    }
+  }
+}
+
 class WebFetcher {
   constructor() {
     this.timeoutMs = 12000;
@@ -161,6 +200,7 @@ class WebFetcher {
     if (isRestrictedHost(parsedUrl.hostname)) {
       throw new Error(`Access to local or private network address "${parsedUrl.hostname}" is restricted for security.`);
     }
+    await validateHostnameDns(parsedUrl.hostname);
 
     // 3. Wikipedia endpoint optimization
     // Wikipedia provides a dedicated semantic HTML endpoint that delivers high-quality content without nav/ads
@@ -206,6 +246,7 @@ class WebFetcher {
       if (isRestrictedHost(parsed.hostname)) {
         throw new Error(`Access to local or private network address "${parsed.hostname}" is restricted for security.`);
       }
+      await validateHostnameDns(parsed.hostname);
 
       let res;
       try {

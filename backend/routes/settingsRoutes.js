@@ -55,7 +55,7 @@ router.post('/test-connection', async (req, res) => {
     });
   }
 
-  // Validate baseUrl protocol
+  // Validate baseUrl protocol and security boundaries
   try {
     const parsed = new URL(baseUrl);
     if (!['http:', 'https:'].includes(parsed.protocol)) {
@@ -63,6 +63,21 @@ router.post('/test-connection', async (req, res) => {
         success: false,
         latencyMs: 0,
         message: 'Invalid base URL: must use http or https protocol',
+      });
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === '169.254.169.254' ||
+      host.startsWith('169.254.') ||
+      host === 'metadata.google.internal' ||
+      host.endsWith('.metadata.google.internal') ||
+      host === 'metadata'
+    ) {
+      return res.json({
+        success: false,
+        latencyMs: 0,
+        message: 'Access to cloud metadata services is restricted for security',
       });
     }
   } catch (_) {

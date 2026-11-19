@@ -13,6 +13,10 @@ import unicodedata
 import sys
 from typing import Optional
 
+_sidecar_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _sidecar_root not in sys.path:
+    sys.path.insert(0, _sidecar_root)
+
 def _resolve_kokoro_dir() -> str:
     if os.environ.get('OMNITOME_KOKORO_DIR'):
         return os.environ['OMNITOME_KOKORO_DIR']
@@ -149,6 +153,7 @@ def load_engine():
     try:
         import torch
         from kokoro import KPipeline, KModel
+        from security.integrity import safe_torch_load, load_verified_checkpoint_stream, ModelIntegrityError
     except ImportError as e:
         raise ModelNotInstalledError(f"Kokoro library not installed: {e}")
 
@@ -176,25 +181,30 @@ def load_engine():
 
         if os.path.exists(config_path):
             print(f"[TTS] Found local Kokoro config at {config_path}")
+            model_stream = load_verified_checkpoint_stream(model_path)
             try:
-                kmodel = KModel(repo_id='hexgrad/Kokoro-82M', config=config_path, model=model_path).to(device).eval()
+                kmodel = KModel(repo_id='hexgrad/Kokoro-82M', config=config_path, model=model_stream).to(device).eval()
                 _engine = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', model=kmodel, device=device)
             except TypeError:
                 try:
-                    kmodel = KModel(config=config_path, model=model_path).to(device).eval()
+                    model_stream.seek(0)
+                    kmodel = KModel(config=config_path, model=model_stream).to(device).eval()
                     _engine = KPipeline(lang_code='a', model=kmodel, device=device)
                 except TypeError:
-                    _engine = KPipeline(lang_code='a', model=model_path, config=config_path, device=device)
+                    model_stream.seek(0)
+                    _engine = KPipeline(lang_code='a', model=model_stream, config=config_path, device=device)
         else:
             if os.environ.get("HF_HUB_OFFLINE") == "1":
                 raise ModelNotInstalledError(
                     f"Kokoro config.json was not found in {model_dir} and HF_HUB_OFFLINE=1 prevents downloading it from HuggingFace."
                 )
+            model_stream = load_verified_checkpoint_stream(model_path)
             try:
-                kmodel = KModel(repo_id='hexgrad/Kokoro-82M', model=model_path).to(device).eval()
+                kmodel = KModel(repo_id='hexgrad/Kokoro-82M', model=model_stream).to(device).eval()
                 _engine = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', model=kmodel, device=device)
             except Exception:
-                _engine = KPipeline(lang_code='a', model=model_path, device=device)
+                model_stream.seek(0)
+                _engine = KPipeline(lang_code='a', model=model_stream, device=device)
 
         # Attach offline voice resolver to pipeline so it never invokes hf_hub_download
         def _custom_load_single_voice(voice: str):
@@ -209,8 +219,7 @@ def load_engine():
 
             v_path = _resolve_voice_path(clean_name)
             if v_path and os.path.isfile(v_path):
-                import torch
-                pack = torch.load(v_path, weights_only=True)
+                pack = safe_torch_load(v_path, weights_only=True)
                 if hasattr(_engine, 'voices'):
                     _engine.voices[voice] = pack
                     _engine.voices[clean_name] = pack

@@ -12,6 +12,8 @@ sidecar_dir = os.path.abspath(os.path.dirname(SPEC))
 datas = [
     (os.path.join(sidecar_dir, 'common.py'), '.'),
     (os.path.join(sidecar_dir, 'lifecycle.py'), '.'),
+    (os.path.join(sidecar_dir, 'security'), 'security'),
+    (os.path.join(sidecar_dir, 'models', 'checksums.json'), 'models'),
 ]
 
 # Explicitly ensure paddleocr assets and internal packages (ppocr, tools) are bundled
@@ -164,6 +166,7 @@ hiddenimports = [
     # Sidecar internal modules
     'common',
     'lifecycle',
+    'security.integrity',
     'ocr.routes',
     'nlp.routes',
     'nlp.sanitize',

@@ -76,7 +76,8 @@ test-*.txt
 docs/*.md.bak-*
 
 # Kokoro / sidecar ML model weights (downloaded at runtime, not shipped in git)
-sidecars/python/models/
+sidecars/python/models/*
+!sidecars/python/models/checksums.json
 
 # Tauri build artifacts
 src-tauri/target/
@@ -88,7 +89,8 @@ build-sidecar/
 # Production installer staging & resources
 resources/node/
 resources/backend-runtime/
-resources/models/
+resources/models/*
+!resources/models/manifest.json
 resources/sidecar.zip
 resources/sidecar.7z
 

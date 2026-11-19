@@ -199,7 +199,18 @@ class ImportQueueService {
     if (file.buffer) {
       await fs.promises.writeFile(stagingPath, file.buffer);
     } else if (file.path && fs.existsSync(file.path)) {
-      await fs.promises.copyFile(file.path, stagingPath);
+      const os = require('node:os');
+      const resolvedSrc = path.resolve(file.path);
+      const allowedRoots = [
+        path.resolve(config.STAGING_DIR),
+        path.resolve(os.tmpdir()),
+        path.resolve(path.join(__dirname, '..', '..', '..', 'storage')),
+      ];
+      const isAllowed = allowedRoots.some((root) => resolvedSrc.startsWith(root + path.sep) || resolvedSrc === root);
+      if (!isAllowed) {
+        throw new Error(`Access denied: file path "${file.path}" is outside permitted temporary directories.`);
+      }
+      await fs.promises.copyFile(resolvedSrc, stagingPath);
     } else {
       throw new Error('File buffer or path is invalid.');
     }

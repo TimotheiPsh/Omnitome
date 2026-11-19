@@ -9,6 +9,7 @@
 
 const express = require('express');
 const fs = require('fs');
+const path = require('node:path');
 const router = express.Router();
 const ttsClient = require('../services/ai/ttsClient');
 
@@ -62,19 +63,43 @@ router.get('/audio/:hash', (req, res) => {
 
   const voice = req.query.voice || 'af_heart';
   const { filePath } = ttsClient.resolveAudioPath(hash, voice);
+  const resolvedPath = path.resolve(filePath);
+  const resolvedBase = path.resolve(ttsClient.TTS_CACHE_DIR);
 
-  if (!fs.existsSync(filePath)) {
+  // Path containment & traversal defense
+  if (!resolvedPath.startsWith(resolvedBase + path.sep)) {
+    return res.status(403).json({
+      error: 'Access denied: audio file path is outside cache directory.',
+      code: 'FORBIDDEN_PATH',
+    });
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
     return res.status(404).json({
       error: 'Audio file not found in cache.',
       code: 'AUDIO_NOT_FOUND',
     });
   }
 
+  // Symlink resolution containment check
+  try {
+    const realPath = fs.realpathSync(resolvedPath);
+    const realBase = fs.realpathSync(resolvedBase);
+    if (!realPath.startsWith(realBase + path.sep)) {
+      return res.status(403).json({
+        error: 'Access denied: resolved audio symlink escapes cache boundary.',
+        code: 'FORBIDDEN_SYMLINK',
+      });
+    }
+  } catch {
+    // If realpathSync fails on race condition, 404 handler or Express sendFile handles it
+  }
+
   res.set('Content-Type', 'audio/wav');
   res.set('Accept-Ranges', 'bytes');
   res.set('Cache-Control', 'public, max-age=31536000, immutable');
 
-  return res.sendFile(filePath);
+  return res.sendFile(resolvedPath);
 });
 
 /**

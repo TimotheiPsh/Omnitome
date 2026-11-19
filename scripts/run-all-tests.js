@@ -87,6 +87,7 @@ const SUITES = [
   'tts_and_library_fix_test.js',
   'security_redos_table_test.js',
   'security_ssrf_test.js',
+  'security_path_traversal_test.js',
 ];
 
 const NETWORK_SUITES = [

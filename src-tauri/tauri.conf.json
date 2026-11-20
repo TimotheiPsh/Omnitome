@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Omnitome",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "identifier": "com.omnitome.app",
   "build": {
     "beforeDevCommand": "npm --prefix frontend run dev",
@@ -48,8 +48,8 @@
     ],
     "resources": {
       "../resources/sidecar.7z": "sidecar.7z",
-      "../resources/backend-runtime": "backend",
-      "../resources/node": "node"
+      "../resources/backend.7z": "backend.7z",
+      "../resources/node.7z": "node.7z"
     },
     "windows": {
       "webviewInstallMode": {

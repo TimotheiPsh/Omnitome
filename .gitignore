@@ -93,6 +93,8 @@ resources/models/*
 !resources/models/manifest.json
 resources/sidecar.zip
 resources/sidecar.7z
+resources/node.7z
+resources/backend.7z
 
 # Local agent governance
 AGENTS.md

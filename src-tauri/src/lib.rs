@@ -1317,6 +1317,7 @@ fn find_sidecar_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Res
     eprintln!("[Supervisor] Found installation directory for sidecar: {:?}", install_dir);
 
     // If missing or updated, check candidate locations for bundled sidecar.7z
+    #[allow(unused_mut)]
     let mut candidate_archives = get_candidate_sidecar_archives(&install_dir);
     #[cfg(debug_assertions)]
     {
@@ -1405,7 +1406,9 @@ fn find_node_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Result
     eprintln!("[Supervisor] Found installation directory: {:?}", install_dir);
 
     // Check for candidate archives
+    #[allow(unused_mut)]
     let mut candidate_node_archives = get_candidate_node_archives(&install_dir);
+    #[allow(unused_mut)]
     let mut candidate_backend_archives = get_candidate_backend_archives(&install_dir);
     #[cfg(debug_assertions)]
     {
@@ -1719,8 +1722,44 @@ fn setup_supervisor(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[cfg(windows)]
+fn focus_existing_omnitome_window() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> *mut std::ffi::c_void;
+        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
+        fn SetForegroundWindow(hWnd: *mut std::ffi::c_void) -> i32;
+    }
+
+    let title_wide: Vec<u16> = OsStr::new("Omnitome").encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title_wide.as_ptr());
+        if !hwnd.is_null() {
+            // SW_RESTORE = 9
+            ShowWindow(hwnd, 9);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn focus_existing_omnitome_window() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    let _single_instance_lock = match platform_lock::OsMutex::acquire("Local\\Omnitome_Application_Instance_Mutex", Duration::from_millis(0)) {
+        Ok((lock, _abandoned)) => lock,
+        Err(_) => {
+            eprintln!("[Supervisor] Another instance of Omnitome is already running. Focusing existing window and exiting.");
+            focus_existing_omnitome_window();
+            return;
+        }
+    };
+
     let builder = tauri::Builder::default()
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && payload.event() == tauri::webview::PageLoadEvent::Finished {
@@ -2959,5 +2998,24 @@ mod tests {
         assert_eq!(status2.code(), Some(0), "Child process should acquire lock after parent released it");
 
         let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_single_instance_mutex_exclusion() {
+        let lock1 = platform_lock::OsMutex::acquire("Local\\Omnitome_Test_Instance_Mutex", Duration::from_millis(0));
+        assert!(lock1.is_ok(), "First acquire must succeed");
+
+        // Concurrent acquire from another thread/process with 0 timeout must fail immediately
+        let handle = thread::spawn(|| {
+            platform_lock::OsMutex::acquire("Local\\Omnitome_Test_Instance_Mutex", Duration::from_millis(0)).is_err()
+        });
+        assert!(handle.join().unwrap(), "Concurrent acquire from another thread must fail with 0 timeout");
+
+        drop(lock1);
+
+        let handle2 = thread::spawn(|| {
+            platform_lock::OsMutex::acquire("Local\\Omnitome_Test_Instance_Mutex", Duration::from_millis(0)).is_ok()
+        });
+        assert!(handle2.join().unwrap(), "Acquiring after drop must succeed");
     }
 }

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
-  <a href="https://github.com/ayumu-ml/Omnitome/releases/latest"><img src="https://img.shields.io/badge/Release-v1.1.1%20Stable-0052CC" alt="Release: v1.1.1 Stable" /></a>
+  <a href="https://github.com/ayumu-ml/Omnitome/releases/latest"><img src="https://img.shields.io/badge/Release-v1.1.2%20Stable-0052CC" alt="Release: v1.1.2 Stable" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%20x64-lightgrey" alt="Platform: Windows x64" />
   <img src="https://img.shields.io/badge/Tauri-v2.0%20(Rust)-FFC131?logo=tauri&logoColor=black" alt="Tauri v2" />
   <img src="https://img.shields.io/badge/Orchestrator-Node.js%2022%20LTS-339933?logo=node.js&logoColor=white" alt="Node.js 22 LTS" />
@@ -20,7 +20,7 @@
 
 <p align="center">
   <a href="https://github.com/ayumu-ml/Omnitome/releases/latest">
-    <img src="https://img.shields.io/badge/Download_Omnitome_v1.1.1-Windows_x64_(1.95_GB)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download Omnitome v1.1.1 for Windows" />
+    <img src="https://img.shields.io/badge/Download_Omnitome_v1.1.2-Windows_x64_(1.82_GB)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download Omnitome v1.1.2 for Windows" />
   </a>
   <a href="https://youtu.be/Nmb-qiZpnrk">
     <img src="https://img.shields.io/badge/Watch_Demo-3:44_Master_Walkthrough-E0245E?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch Demo" />
@@ -155,7 +155,7 @@ Additional specifications:
 
 ## Quick Start (Windows x64)
 
-1. **Download:** Grab the latest installer from [GitHub Releases](https://github.com/ayumu-ml/Omnitome/releases/latest) (`Omnitome_1.1.1_x64.exe`, ~1.95 GB).
+1. **Download:** Grab the latest installer from [GitHub Releases](https://github.com/ayumu-ml/Omnitome/releases/latest) (`Omnitome_1.1.2_x64-setup.exe`, ~1.82 GB).
 2. **Launch:** Run the installer. On first launch, the Welcome Wizard configures your local environment.
 3. **Inference Setup:** Omnitome connects out-of-the-box with local runners like [Ollama](https://ollama.ai/) or [LM Studio](https://lmstudio.ai/) for 100% private offline reading, or with optional cloud API keys.
 4. **Drop & Read:** Drag in any PDF, EPUB, DOCX, RTF, Markdown, or text file. Omnitome parses, indexes, and synthesizes traceable chapters in the background.

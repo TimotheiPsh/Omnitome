@@ -206,7 +206,14 @@ class ImportQueueService {
         path.resolve(os.tmpdir()),
         path.resolve(path.join(__dirname, '..', '..', '..', 'storage')),
       ];
-      const isAllowed = allowedRoots.some((root) => resolvedSrc.startsWith(root + path.sep) || resolvedSrc === root);
+      let isAllowed = false;
+      for (const root of allowedRoots) {
+        const rel = path.relative(root, resolvedSrc);
+        if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+          isAllowed = true;
+          break;
+        }
+      }
       if (!isAllowed) {
         throw new Error(`Access denied: file path "${file.path}" is outside permitted temporary directories.`);
       }

@@ -8,12 +8,27 @@
 'use strict';
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('node:path');
 const router = express.Router();
 const ttsClient = require('../services/ai/ttsClient');
 
 const HASH_REGEX = /^[a-f0-9]{64}$/;
+
+// Generous rate limiter for audio file access (CWE-770 mitigation)
+// Allows up to 1,000 audio chunk requests per minute so local speech narration
+// is never throttled while guarding disk reads against resource exhaustion.
+const audioRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many audio requests from this IP, please try again after a minute.',
+    code: 'RATE_LIMIT_EXCEEDED',
+  },
+});
 
 /**
  * POST /api/tts/synthesize
@@ -52,7 +67,7 @@ router.post('/synthesize', async (req, res, next) => {
  * Query: ?voice=af_heart
  * Serves 24kHz 16-bit mono WAV file with static cache headers.
  */
-router.get('/audio/:hash', (req, res) => {
+router.get('/audio/:hash', audioRateLimiter, (req, res) => {
   const { hash } = req.params;
   if (!hash || !HASH_REGEX.test(hash)) {
     return res.status(400).json({

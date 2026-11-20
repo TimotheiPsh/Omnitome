@@ -206,18 +206,21 @@ class ImportQueueService {
         path.resolve(os.tmpdir()),
         path.resolve(path.join(__dirname, '..', '..', '..', 'storage')),
       ];
-      let isAllowed = false;
+      let sanitizedSrc = null;
       for (const root of allowedRoots) {
-        const rel = path.relative(root, resolvedSrc);
-        if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
-          isAllowed = true;
-          break;
+        const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+        if (resolvedSrc.startsWith(prefix) || resolvedSrc === root) {
+          const rel = path.relative(root, resolvedSrc);
+          if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+            sanitizedSrc = path.join(root, rel);
+            break;
+          }
         }
       }
-      if (!isAllowed) {
+      if (!sanitizedSrc) {
         throw new Error(`Access denied: file path "${file.path}" is outside permitted temporary directories.`);
       }
-      await fs.promises.copyFile(resolvedSrc, stagingPath);
+      await fs.promises.copyFile(sanitizedSrc, stagingPath);
     } else {
       throw new Error('File buffer or path is invalid.');
     }

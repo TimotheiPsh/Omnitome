@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Sender};
@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 #[cfg(windows)]
@@ -167,6 +168,29 @@ fn kill_pid(pid: u32) {
     }
 }
 
+#[allow(dead_code)]
+fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {}", pid), "/NH"]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = cmd.output() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            return s.contains(&pid.to_string());
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        res == 0
+    }
+}
+
 fn cleanup_stale_pids(app_dir: &Path) {
     let pids_path = app_dir.join("pids.json");
     if pids_path.exists() {
@@ -281,9 +305,685 @@ fn atomic_rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Failed to rename directory")))
 }
 
-fn unpack_sidecar_7z(archive_path: &Path, target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[Supervisor] Unpacking sidecar engine from {:?} to {:?}", archive_path, target_dir);
+// --- SHA-256 Digest Implementation ---
 
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn compute_file_sha256(path: &Path) -> std::io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(128 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+// --- Windows-Native Inter-Process Synchronization ---
+
+#[cfg(windows)]
+pub mod platform_lock {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
+
+    type HANDLE = *mut std::ffi::c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    const WAIT_OBJECT_0: DWORD = 0x00000000;
+    const WAIT_ABANDONED: DWORD = 0x00000080;
+    const WAIT_TIMEOUT: DWORD = 0x00000102;
+    const WAIT_FAILED: DWORD = 0xFFFFFFFF;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(
+            lpMutexAttributes: *mut std::ffi::c_void,
+            bInitialOwner: BOOL,
+            lpName: *const u16,
+        ) -> HANDLE;
+        fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+        fn ReleaseMutex(hMutex: HANDLE) -> BOOL;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn GetLastError() -> DWORD;
+    }
+
+    pub struct OsMutex {
+        handle: HANDLE,
+    }
+
+    unsafe impl Send for OsMutex {}
+    unsafe impl Sync for OsMutex {}
+
+    impl OsMutex {
+        pub fn acquire(name: &str, timeout: Duration) -> Result<(Self, bool), String> {
+            let name_wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+            let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name_wide.as_ptr()) };
+            if handle.is_null() {
+                let err = unsafe { GetLastError() };
+                return Err(format!("CreateMutexW failed with code {}", err));
+            }
+
+            let timeout_ms = if timeout.as_millis() > (u32::MAX as u128) {
+                u32::MAX
+            } else {
+                timeout.as_millis() as u32
+            };
+
+            let res = unsafe { WaitForSingleObject(handle, timeout_ms) };
+            match res {
+                WAIT_OBJECT_0 => Ok((Self { handle }, false)),
+                WAIT_ABANDONED => {
+                    eprintln!("[Supervisor] Acquired abandoned mutex {:?} (previous owner terminated abnormally)", name);
+                    Ok((Self { handle }, true))
+                }
+                WAIT_TIMEOUT => {
+                    unsafe { CloseHandle(handle) };
+                    Err(format!("Timeout ({:?}) waiting for mutex {:?}", timeout, name))
+                }
+                WAIT_FAILED => {
+                    let err = unsafe { GetLastError() };
+                    unsafe { CloseHandle(handle) };
+                    Err(format!("WaitForSingleObject failed on mutex {:?} with code {}", name, err))
+                }
+                other => {
+                    unsafe { CloseHandle(handle) };
+                    Err(format!("Unexpected wait result {} on mutex {:?}", other, name))
+                }
+            }
+        }
+    }
+
+    impl Drop for OsMutex {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseMutex(self.handle);
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub mod platform_lock {
+    use std::time::Duration;
+    pub struct OsMutex;
+    impl OsMutex {
+        pub fn acquire(_name: &str, _timeout: Duration) -> Result<(Self, bool), String> {
+            Ok((Self, false))
+        }
+    }
+}
+
+// --- Cross-Process Extraction Lock ---
+
+pub struct ExtractionLock {
+    #[cfg(windows)]
+    _os_mutex: platform_lock::OsMutex,
+    pub lock_path: PathBuf,
+    pub was_abandoned: bool,
+}
+
+pub fn compute_mutex_name(lock_dir: &Path, name: &str) -> String {
+    let clean_path = strip_windows_verbatim(lock_dir);
+    let normalized_path = clean_path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let path_hash = compute_sha256(normalized_path.as_bytes());
+    let safe_name: String = name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!("Local\\Omnitome_Extract_{}_{}", safe_name, &path_hash[..16])
+}
+
+impl ExtractionLock {
+    pub fn acquire(lock_dir: &Path, name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::acquire_with_timeout(lock_dir, name, Duration::from_secs(60))
+    }
+
+    pub fn acquire_with_timeout(lock_dir: &Path, name: &str, timeout: Duration) -> Result<Self, Box<dyn std::error::Error>> {
+        let lock_path = lock_dir.join(format!(".{}.lock", name));
+        let mutex_name = compute_mutex_name(lock_dir, name);
+
+        let (os_mutex, was_abandoned) = platform_lock::OsMutex::acquire(&mutex_name, timeout)
+            .map_err(|e| format!("Failed to acquire extraction lock on {:?}: {}", lock_path, e))?;
+
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&lock_path)
+        {
+            let pid = std::process::id();
+            let _ = writeln!(file, "{}", pid);
+            let _ = file.flush();
+        }
+
+        Ok(Self {
+            #[cfg(windows)]
+            _os_mutex: os_mutex,
+            lock_path,
+            was_abandoned,
+        })
+    }
+}
+
+impl Drop for ExtractionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+// --- Decompression Resource Limits ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    pub max_uncompressed_bytes: u64,
+    pub max_entries: usize,
+    pub max_single_file_bytes: u64,
+}
+
+impl ArchiveLimits {
+    pub fn node() -> Self {
+        Self {
+            max_uncompressed_bytes: 200 * 1024 * 1024,      // 200 MB (actual payload: ~83 MB)
+            max_entries: 100,                               // 100 entries (actual payload: 1)
+            max_single_file_bytes: 150 * 1024 * 1024,       // 150 MB (actual payload: ~83 MB)
+        }
+    }
+
+    pub fn backend() -> Self {
+        Self {
+            max_uncompressed_bytes: 800 * 1024 * 1024,      // 800 MB (actual payload: ~253 MB across 7,799 entries)
+            max_entries: 20_000,                            // 20,000 entries (actual payload: 7,799)
+            max_single_file_bytes: 100 * 1024 * 1024,       // 100 MB (actual largest file: onnxruntime.dll @ 28.8 MB)
+        }
+    }
+
+    pub fn sidecar() -> Self {
+        Self {
+            max_uncompressed_bytes: 8 * 1024 * 1024 * 1024, // 8.0 GiB (actual payload: ~5.14 GiB across 10,219 entries)
+            max_entries: 25_000,                            // 25,000 entries (actual payload: 10,219)
+            max_single_file_bytes: 1536 * 1024 * 1024,      // 1.5 GiB (actual largest file: torch_cuda.dll @ ~957 MB)
+        }
+    }
+
+    pub fn default_for(target_name: &str, expected_file: &str) -> Self {
+        if target_name.eq_ignore_ascii_case("node") || expected_file.eq_ignore_ascii_case("node.exe") {
+            Self::node()
+        } else if target_name.eq_ignore_ascii_case("backend") || expected_file.eq_ignore_ascii_case("server.js") {
+            Self::backend()
+        } else if target_name.eq_ignore_ascii_case("sidecar") || expected_file.eq_ignore_ascii_case("omnitome-sidecar.exe") {
+            Self::sidecar()
+        } else {
+            Self {
+                max_uncompressed_bytes: 8 * 1024 * 1024 * 1024,
+                max_entries: 25_000,
+                max_single_file_bytes: 1536 * 1024 * 1024,
+            }
+        }
+    }
+}
+
+// --- Windows Path Hardening & Attribute Validation ---
+
+fn is_dos_reserved_device(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "CLOCK$",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED.iter().any(|&r| r.eq_ignore_ascii_case(name))
+}
+
+pub fn validate_entry_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if name.is_empty() {
+        // Empty entry name represents the archive root directory in sevenz-rust
+        return Ok(());
+    }
+    // Reject ASCII control characters (0x00..=0x1F)
+    if name.chars().any(|c| (c as u32) < 32) {
+        return Err("Archive entry contains forbidden null or control character".into());
+    }
+    // Reject colons anywhere in path (NTFS Alternate Data Streams, drive specifiers, ADS payload evasion)
+    if name.contains(':') {
+        return Err(format!("Archive entry contains colon / NTFS Alternate Data Stream: {:?}", name).into());
+    }
+    // Reject Windows forbidden characters: < > " | ? *
+    const FORBIDDEN_CHARS: &[char] = &['<', '>', '"', '|', '?', '*'];
+    if let Some(bad_char) = name.chars().find(|c| FORBIDDEN_CHARS.contains(c)) {
+        return Err(format!("Archive entry contains forbidden Windows character {:?}: {:?}", bad_char, name).into());
+    }
+    if name.contains("..") {
+        return Err(format!("Archive entry contains dangerous '..' path traversal: {:?}", name).into());
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Err(format!("Archive entry contains absolute root path: {:?}", name).into());
+    }
+
+    let components: Vec<&str> = name.split(['/', '\\']).collect();
+    let num_components = components.len();
+
+    for (idx, &comp) in components.iter().enumerate() {
+        if comp.is_empty() {
+            // Standard directory entries in 7z may have a trailing slash (e.g. "dir/")
+            if idx == num_components - 1 && num_components > 1 {
+                continue;
+            }
+            return Err(format!("Archive entry contains redundant slashes or empty component: {:?}", name).into());
+        }
+
+        if comp == "." {
+            return Err(format!("Archive entry contains '.' current-directory token: {:?}", name).into());
+        }
+
+        if comp.ends_with('.') || comp.ends_with(' ') {
+            return Err(format!("Archive entry component ends with dot or space: {:?}", name).into());
+        }
+
+        if comp.starts_with(' ') {
+            return Err(format!("Archive entry component starts with space: {:?}", name).into());
+        }
+
+        let stem = comp.split('.').next().unwrap_or("").trim();
+        if is_dos_reserved_device(stem) {
+            return Err(format!("Archive entry component is a Windows DOS reserved device name: {:?}", name).into());
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_entry_attributes(entry: &sevenz_rust::SevenZArchiveEntry) -> Result<(), Box<dyn std::error::Error>> {
+    if entry.has_windows_attributes {
+        let attrs = entry.windows_attributes;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(format!(
+                "Archive entry {:?} rejected: reparse point / symlink attribute detected ({:#010x})",
+                entry.name(), attrs
+            ).into());
+        }
+        let posix_type = (attrs >> 16) & 0xF000;
+        if posix_type == 0xA000 {
+            return Err(format!(
+                "Archive entry {:?} rejected: POSIX symlink detected (mode {:#06o})",
+                entry.name(), (attrs >> 16) & 0xFFFF
+            ).into());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_archive_entries(archive_path: &Path, limits: ArchiveLimits) -> Result<(), Box<dyn std::error::Error>> {
+    let sz = sevenz_rust::SevenZReader::open(archive_path, sevenz_rust::Password::empty())
+        .map_err(|e| format!("Failed to read 7z central directory of {:?}: {}", archive_path, e))?;
+
+    let files = &sz.archive().files;
+    if files.len() > limits.max_entries {
+        return Err(format!(
+            "Archive {:?} contains {} entries, exceeding maximum permitted limit of {}",
+            archive_path, files.len(), limits.max_entries
+        ).into());
+    }
+
+    let mut total_uncompressed_bytes: u64 = 0;
+    for entry in files.iter() {
+        validate_entry_name(entry.name())?;
+        validate_entry_attributes(entry)?;
+
+        if entry.size() > limits.max_single_file_bytes {
+            return Err(format!(
+                "Archive entry {:?} has uncompressed size {} bytes, exceeding maximum single file limit of {} bytes",
+                entry.name(), entry.size(), limits.max_single_file_bytes
+            ).into());
+        }
+
+        total_uncompressed_bytes = total_uncompressed_bytes.checked_add(entry.size())
+            .ok_or_else(|| format!("Integer overflow calculating uncompressed size of {:?}", archive_path))?;
+
+        if total_uncompressed_bytes > limits.max_uncompressed_bytes {
+            return Err(format!(
+                "Archive {:?} total uncompressed size exceeds maximum permitted limit of {} bytes",
+                archive_path, limits.max_uncompressed_bytes
+            ).into());
+        }
+    }
+
+    Ok(())
+}
+
+// --- Completion Manifest & Verification ---
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CriticalFileCheck {
+    pub relative_path: String,
+    pub min_size: u64,
+    pub is_directory: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtractionManifest {
+    pub version: u32,
+    pub archive_name: String,
+    pub archive_size: u64,
+    pub archive_sha256: String,
+    pub extracted_at: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub critical_files: Vec<CriticalFileCheck>,
+}
+
+fn collect_critical_files_in_staging(staging_dir: &Path, expected_file: &str) -> Vec<CriticalFileCheck> {
+    let mut critical = Vec::new();
+    // 1. Always record expected_file with min_size: 1 (non-zero guard)
+    critical.push(CriticalFileCheck {
+        relative_path: expected_file.to_string(),
+        min_size: 1,
+        is_directory: false,
+    });
+
+    // 2. Discover standard structural markers if present in payload
+    if staging_dir.join("package.json").exists() {
+        critical.push(CriticalFileCheck {
+            relative_path: "package.json".to_string(),
+            min_size: 1,
+            is_directory: false,
+        });
+    }
+    if staging_dir.join("node_modules").is_dir() {
+        critical.push(CriticalFileCheck {
+            relative_path: "node_modules".to_string(),
+            min_size: 0,
+            is_directory: true,
+        });
+    }
+    if staging_dir.join("_internal").is_dir() || staging_dir.join("omnitome-sidecar").join("_internal").is_dir() {
+        critical.push(CriticalFileCheck {
+            relative_path: "_internal".to_string(),
+            min_size: 0,
+            is_directory: true,
+        });
+    }
+    if staging_dir.join("config.json").exists() {
+        critical.push(CriticalFileCheck {
+            relative_path: "config.json".to_string(),
+            min_size: 1,
+            is_directory: false,
+        });
+    }
+
+    critical
+}
+
+pub fn is_manifest_valid(target_dir: &Path, archive_path: &Path, expected_file: &str) -> bool {
+    let manifest_path = target_dir.join(".extraction_manifest.json");
+    if !manifest_path.exists() {
+        return false;
+    }
+
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let manifest: ExtractionManifest = match serde_json::from_str(&content) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    if manifest.version != 1 {
+        return false;
+    }
+
+    if archive_path.exists() {
+        if let Some(fname) = archive_path.file_name() {
+            if !fname.to_string_lossy().eq_ignore_ascii_case(&manifest.archive_name) {
+                eprintln!(
+                    "[Supervisor] Archive name mismatch for {:?}: manifest={}, current={}. Update detected!",
+                    archive_path, manifest.archive_name, fname.to_string_lossy()
+                );
+                return false;
+            }
+        }
+
+        if let Ok(meta) = archive_path.metadata() {
+            if meta.len() != manifest.archive_size {
+                eprintln!(
+                    "[Supervisor] Archive size mismatch for {:?}: manifest={}, current={}. Update detected!",
+                    archive_path, manifest.archive_size, meta.len()
+                );
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        match compute_file_sha256(archive_path) {
+            Ok(hash) => {
+                if !hash.eq_ignore_ascii_case(&manifest.archive_sha256) {
+                    eprintln!(
+                        "[Supervisor] Archive SHA-256 mismatch for {:?}: manifest={}, current={}. Update detected!",
+                        archive_path, manifest.archive_sha256, hash
+                    );
+                    return false;
+                }
+            }
+            Err(e) => {
+                eprintln!("[Supervisor] Failed to compute archive SHA-256 for {:?}: {}", archive_path, e);
+                return false;
+            }
+        }
+    }
+
+    // Verify critical files
+    for check in &manifest.critical_files {
+        let p1 = target_dir.join(&check.relative_path);
+        let p2 = target_dir.join("omnitome-sidecar").join(&check.relative_path);
+        let path = if p1.exists() {
+            Some(p1)
+        } else if p2.exists() {
+            Some(p2)
+        } else {
+            None
+        };
+
+        match path {
+            None => {
+                eprintln!("[Supervisor] Manifest check failed: missing critical file {:?}", check.relative_path);
+                return false;
+            }
+            Some(ref p) => {
+                if check.is_directory {
+                    if !p.is_dir() {
+                        eprintln!("[Supervisor] Manifest check failed: {:?} is not a directory", p);
+                        return false;
+                    }
+                } else {
+                    let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size < check.min_size {
+                        eprintln!(
+                            "[Supervisor] Manifest check failed: {:?} size {} < min_size {}",
+                            p, size, check.min_size
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify expected verification file is non-zero
+    let exp1 = target_dir.join(expected_file);
+    let exp2 = target_dir.join("omnitome-sidecar").join(expected_file);
+    let exp_size = exp1.metadata().map(|m| m.len())
+        .or_else(|_| exp2.metadata().map(|m| m.len()))
+        .unwrap_or(0);
+    if exp_size == 0 {
+        eprintln!("[Supervisor] Manifest check failed: expected file {:?} is 0 bytes or missing", expected_file);
+        return false;
+    }
+
+    true
+}
+
+fn write_manifest(
+    staging_dir: &Path,
+    archive_path: &Path,
+    file_count: usize,
+    total_bytes: u64,
+    critical_files: Vec<CriticalFileCheck>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let archive_name = archive_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let archive_size = fs::metadata(archive_path)?.len();
+    let archive_sha256 = compute_file_sha256(archive_path)?;
+    let extracted_at = chrono::Utc::now().to_rfc3339();
+
+    let manifest = ExtractionManifest {
+        version: 1,
+        archive_name,
+        archive_size,
+        archive_sha256,
+        extracted_at,
+        file_count,
+        total_bytes,
+        critical_files,
+    };
+
+    let json = serde_json::to_string_pretty(&manifest)?;
+    let manifest_path = staging_dir.join(".extraction_manifest.json");
+    fs::write(manifest_path, json)?;
+    Ok(())
+}
+
+// --- Rollback-Safe Promotion & Startup Recovery ---
+
+pub fn recover_interrupted_rotations(target_dir: &Path, expected_file: &str) {
+    let backup_dir = target_dir.with_extension("backup");
+    let staging_dir = target_dir.with_extension("staging");
+
+    let target_has_expected = target_dir.exists() && (
+        target_dir.join(expected_file).exists() || target_dir.join("omnitome-sidecar").join(expected_file).exists()
+    );
+    let backup_has_expected = backup_dir.exists() && (
+        backup_dir.join(expected_file).exists() || backup_dir.join("omnitome-sidecar").join(expected_file).exists()
+    );
+
+    // Case 1: Target is missing or broken (e.g. empty stub or interrupted promotion),
+    // but backup contains the valid runtime.
+    // Invariant: Never delete the last validated runtime -> restore backup -> target.
+    if !target_has_expected && backup_has_expected {
+        eprintln!(
+            "[Supervisor] Interrupted rotation detected: target {:?} missing or broken, but valid backup found. Restoring {:?} -> {:?}",
+            target_dir, backup_dir, target_dir
+        );
+        if target_dir.exists() {
+            let _ = wipe_dir(target_dir);
+        }
+        if let Err(e) = atomic_rename_dir(&backup_dir, target_dir) {
+            eprintln!("[Supervisor] Error restoring backup directory to target: {}", e);
+        }
+        if staging_dir.exists() {
+            let _ = wipe_dir(&staging_dir);
+        }
+        return;
+    }
+
+    // Case 2: Target contains the valid runtime and backup_dir exists (promotion finished, but backup cleanup was interrupted).
+    if target_has_expected && backup_dir.exists() {
+        eprintln!("[Supervisor] Interrupted cleanup detected: removing leftover backup directory {:?}", backup_dir);
+        if let Err(e) = wipe_dir(&backup_dir) {
+            eprintln!("[Supervisor] Notice: Leftover backup directory cleanup deferred: {}", e);
+        }
+    }
+}
+
+pub fn promote_staging_dir(staging_dir: &Path, target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let backup_dir = target_dir.with_extension("backup");
+
+    if backup_dir.exists() {
+        let _ = wipe_dir(&backup_dir);
+        if backup_dir.exists() {
+            return Err(format!("Cannot promote: failed to remove stale backup directory {:?}", backup_dir).into());
+        }
+    }
+
+    let had_existing_target = target_dir.exists();
+
+    // Step A: Move existing target to backup if it exists
+    if had_existing_target {
+        atomic_rename_dir(target_dir, &backup_dir)
+            .map_err(|e| format!("Failed to move existing target {:?} to backup {:?}: {}", target_dir, backup_dir, e))?;
+    }
+
+    // Step B: Promote staging to target
+    if let Err(e) = atomic_rename_dir(staging_dir, target_dir) {
+        eprintln!("[Supervisor] Promotion failed: {}. Attempting rollback...", e);
+        if had_existing_target && backup_dir.exists() {
+            match atomic_rename_dir(&backup_dir, target_dir) {
+                Ok(()) => eprintln!("[Supervisor] Rollback succeeded: previous target runtime restored."),
+                Err(rollback_err) => eprintln!("[Supervisor] FATAL: Rollback failed: {}. Backup preserved at {:?}", rollback_err, backup_dir),
+            }
+        }
+        if staging_dir.exists() {
+            let _ = wipe_dir(staging_dir);
+        }
+        return Err(format!("Failed to promote staging to target (rollback attempted): {}", e).into());
+    }
+
+    // Step C: Cleanup backup after successful promotion (failure is non-fatal)
+    if backup_dir.exists() {
+        if let Err(e) = wipe_dir(&backup_dir) {
+            eprintln!("[Supervisor] Notice: Cleanup of backup {:?} deferred: {}", backup_dir, e);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn unpack_managed_archive_7z(
+    archive_path: &Path,
+    target_dir: &Path,
+    expected_file: &str,
+    delete_archive_on_success: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let archive_path = strip_windows_verbatim(archive_path);
+    let target_dir = strip_windows_verbatim(target_dir);
+
+    // Startup recovery of any interrupted rotations
+    recover_interrupted_rotations(&target_dir, expected_file);
+
+    // Fast-path: check if target directory already has a verified manifest matching archive SHA-256
+    if is_manifest_valid(&target_dir, &archive_path, expected_file) {
+        return Ok(());
+    }
+
+    let parent_dir = target_dir.parent().ok_or("Target directory has no parent")?;
+    fs::create_dir_all(parent_dir)?;
+
+    let target_name = target_dir.file_name().unwrap_or_default().to_string_lossy();
+    let _lock = ExtractionLock::acquire(parent_dir, &target_name)?;
+
+    // Re-check post-lock: another process may have completed extraction while we waited
+    recover_interrupted_rotations(&target_dir, expected_file);
+    if is_manifest_valid(&target_dir, &archive_path, expected_file) {
+        return Ok(());
+    }
+
+    eprintln!("[Supervisor] Unpacking managed archive from {:?} to {:?}", archive_path, target_dir);
+
+    let limits = ArchiveLimits::default_for(&target_name, expected_file);
+
+    // Step 1: Pre-extraction archive header and entry validation
+    validate_archive_entries(&archive_path, limits)?;
+
+    // Step 2: Clean and prepare staging directory
     let staging_dir = target_dir.with_extension("staging");
     if staging_dir.exists() {
         eprintln!("[Supervisor] Cleaning stale staging directory {:?}", staging_dir);
@@ -293,26 +993,163 @@ fn unpack_sidecar_7z(archive_path: &Path, target_dir: &Path) -> Result<(), Box<d
     fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("Failed to create staging directory {:?}: {}", staging_dir, e))?;
 
-    if let Err(e) = sevenz_rust::decompress_file(archive_path, &staging_dir) {
+    // Step 3: Decompress into staging directory with in-flight validation
+    let mut extracted_file_count: usize = 0;
+    let mut extracted_bytes: u64 = 0;
+
+    let decompress_res = sevenz_rust::decompress_file_with_extract_fn(
+        &archive_path,
+        &staging_dir,
+        |entry, reader, dest_path| {
+            validate_entry_name(entry.name())
+                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+            validate_entry_attributes(entry)
+                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+
+            if !dest_path.starts_with(&staging_dir) {
+                return Err(sevenz_rust::Error::other(format!(
+                    "Path containment violation: {:?} escapes staging dir {:?}",
+                    dest_path, staging_dir
+                )));
+            }
+
+            if entry.size() > limits.max_single_file_bytes {
+                return Err(sevenz_rust::Error::other(format!(
+                    "File {:?} size {} exceeds max single file limit {}",
+                    entry.name(), entry.size(), limits.max_single_file_bytes
+                )));
+            }
+
+            extracted_file_count += 1;
+            if extracted_file_count > limits.max_entries {
+                return Err(sevenz_rust::Error::other(format!(
+                    "Archive exceeds max entry count limit {}",
+                    limits.max_entries
+                )));
+            }
+
+            if entry.is_directory() {
+                if !dest_path.exists() {
+                    fs::create_dir_all(dest_path).map_err(sevenz_rust::Error::io)?;
+                }
+            } else {
+                if let Some(parent) = dest_path.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
+                    }
+                }
+                let file = fs::File::create(dest_path)
+                    .map_err(|e| sevenz_rust::Error::io_msg(e, dest_path.to_string_lossy().to_string()))?;
+                let mut writer = std::io::BufWriter::new(file);
+                let mut limited_reader = reader.take(limits.max_single_file_bytes + 1);
+                let bytes_copied = std::io::copy(&mut limited_reader, &mut writer)
+                    .map_err(sevenz_rust::Error::io)?;
+                writer.flush().map_err(sevenz_rust::Error::io)?;
+
+                if bytes_copied > limits.max_single_file_bytes {
+                    return Err(sevenz_rust::Error::other(format!(
+                        "File {:?} decompressed stream exceeded max single file limit of {} bytes",
+                        entry.name(), limits.max_single_file_bytes
+                    )));
+                }
+
+                extracted_bytes = extracted_bytes.checked_add(bytes_copied)
+                    .ok_or_else(|| sevenz_rust::Error::other("Integer overflow in extracted bytes counter"))?;
+
+                if extracted_bytes > limits.max_uncompressed_bytes {
+                    return Err(sevenz_rust::Error::other(format!(
+                        "Archive exceeded max uncompressed bytes limit of {} bytes during decompression",
+                        limits.max_uncompressed_bytes
+                    )));
+                }
+            }
+            Ok(true)
+        },
+    );
+
+    if let Err(e) = decompress_res {
         let _ = wipe_dir(&staging_dir);
         return Err(format!("Failed to decompress 7z archive {:?}: {}", archive_path, e).into());
     }
 
-    if target_dir.exists() {
-        wipe_dir(target_dir)
-            .map_err(|e| format!("Failed to remove existing target directory {:?}: {}", target_dir, e))?;
+    // Step 4: Verify expected file exists inside staging directory before swap
+    let staging_expected = staging_dir.join(expected_file);
+    let nested_expected = staging_dir.join("omnitome-sidecar").join(expected_file);
+    let expected_len = staging_expected.metadata().map(|m| m.len())
+        .or_else(|_| nested_expected.metadata().map(|m| m.len()))
+        .unwrap_or(0);
+    if expected_len == 0 {
+        let _ = wipe_dir(&staging_dir);
+        return Err(format!(
+            "Decompressed archive {:?}, but expected verification file {:?} was not found or was 0 bytes in staging",
+            archive_path, expected_file
+        ).into());
     }
-    atomic_rename_dir(&staging_dir, target_dir)
-        .map_err(|e| format!("Failed to move unpacked sidecar from {:?} to {:?}: {}", staging_dir, target_dir, e))?;
 
-    // Delete sidecar.7z to reclaim disk space
-    if let Err(e) = fs::remove_file(archive_path) {
-        eprintln!("[Supervisor] Notice: Could not remove archive {:?}: {}", archive_path, e);
-    } else {
-        eprintln!("[Supervisor] Removed sidecar archive {:?} to reclaim disk space", archive_path);
+    // Step 5: Verify critical files in staging and collect manifest list
+    let critical_files = collect_critical_files_in_staging(&staging_dir, expected_file);
+    for check in &critical_files {
+        let p1 = staging_dir.join(&check.relative_path);
+        let p2 = staging_dir.join("omnitome-sidecar").join(&check.relative_path);
+        let found = if p1.exists() {
+            Some(p1)
+        } else if p2.exists() {
+            Some(p2)
+        } else {
+            None
+        };
+        match found {
+            None => {
+                let _ = wipe_dir(&staging_dir);
+                return Err(format!("Critical path {:?} missing in staging for archive {:?}", check.relative_path, archive_path).into());
+            }
+            Some(ref path) => {
+                if check.is_directory {
+                    if !path.is_dir() {
+                        let _ = wipe_dir(&staging_dir);
+                        return Err(format!("Critical path {:?} in staging is not a directory", path).into());
+                    }
+                } else {
+                    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size < check.min_size {
+                        let _ = wipe_dir(&staging_dir);
+                        return Err(format!("Critical file {:?} in staging is undersized ({} < min {})", path, size, check.min_size).into());
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 6: Write completion manifest into staging directory
+    write_manifest(&staging_dir, &archive_path, extracted_file_count, extracted_bytes, critical_files)?;
+
+    // Step 7: Rollback-safe promotion of staging directory into target directory
+    promote_staging_dir(&staging_dir, &target_dir)?;
+
+    // Step 8: Post-swap verification
+    let target_expected = target_dir.join(expected_file);
+    let nested_target_expected = target_dir.join("omnitome-sidecar").join(expected_file);
+    if !target_expected.exists() && !nested_target_expected.exists() {
+        return Err(format!(
+            "Swapped content into {:?}, but verified file {:?} is missing",
+            target_dir, expected_file
+        ).into());
+    }
+
+    // Step 9: Optional archive deletion to reclaim disk space
+    if delete_archive_on_success {
+        if let Err(e) = fs::remove_file(&archive_path) {
+            eprintln!("[Supervisor] Notice: Could not remove archive {:?}: {}", archive_path, e);
+        } else {
+            eprintln!("[Supervisor] Removed archive {:?} to reclaim disk space", archive_path);
+        }
     }
 
     Ok(())
+}
+
+pub fn unpack_sidecar_7z(archive_path: &Path, target_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    unpack_managed_archive_7z(archive_path, target_dir, "omnitome-sidecar.exe", true)
 }
 
 fn is_root_or_empty(s: &str) -> bool {
@@ -406,6 +1243,30 @@ fn get_candidate_sidecar_archives(install_dir: &Path) -> Vec<PathBuf> {
     candidate_archives
 }
 
+fn get_candidate_node_archives(install_dir: &Path) -> Vec<PathBuf> {
+    let clean_dir = strip_windows_verbatim(install_dir);
+    let dir_str = clean_dir.to_string_lossy();
+    if is_root_or_empty(&dir_str) {
+        return Vec::new();
+    }
+    vec![
+        strip_windows_verbatim(&clean_dir.join("resources").join("node.7z")),
+        strip_windows_verbatim(&clean_dir.join("node.7z")),
+    ]
+}
+
+fn get_candidate_backend_archives(install_dir: &Path) -> Vec<PathBuf> {
+    let clean_dir = strip_windows_verbatim(install_dir);
+    let dir_str = clean_dir.to_string_lossy();
+    if is_root_or_empty(&dir_str) {
+        return Vec::new();
+    }
+    vec![
+        strip_windows_verbatim(&clean_dir.join("resources").join("backend.7z")),
+        strip_windows_verbatim(&clean_dir.join("backend.7z")),
+    ]
+}
+
 fn find_sidecar_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Result<(PathBuf, Vec<String>, PathBuf), Box<dyn std::error::Error>> {
     // 1. In dev mode (debug_assertions), prefer venv python main.py or local frozen sidecar
     #[cfg(debug_assertions)]
@@ -441,19 +1302,10 @@ fn find_sidecar_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Res
     }
 
     // 2. In release/packaged mode:
-    // First, check if extracted sidecar already exists in %LOCALAPPDATA%\Omnitome\sidecar\
     let app_data = strip_windows_verbatim(&get_app_data_dir());
     let local_sidecar_dir = strip_windows_verbatim(&app_data.join("sidecar"));
     let local_sidecar_exe = strip_windows_verbatim(&local_sidecar_dir.join("omnitome-sidecar.exe"));
-
-    if local_sidecar_exe.exists() {
-        return Ok((local_sidecar_exe, vec![], local_sidecar_dir));
-    }
     let nested_local_exe = strip_windows_verbatim(&local_sidecar_dir.join("omnitome-sidecar").join("omnitome-sidecar.exe"));
-    if nested_local_exe.exists() {
-        let nested_dir = strip_windows_verbatim(&local_sidecar_dir.join("omnitome-sidecar"));
-        return Ok((nested_local_exe, vec![], nested_dir));
-    }
 
     let exe_path = strip_windows_verbatim(&std::env::current_exe()?);
     let install_dir = exe_path.parent().ok_or("Failed to get install dir")?;
@@ -464,7 +1316,7 @@ fn find_sidecar_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Res
     }
     eprintln!("[Supervisor] Found installation directory for sidecar: {:?}", install_dir);
 
-    // If missing, check candidate locations for bundled sidecar.7z
+    // If missing or updated, check candidate locations for bundled sidecar.7z
     let mut candidate_archives = get_candidate_sidecar_archives(&install_dir);
     #[cfg(debug_assertions)]
     {
@@ -487,6 +1339,14 @@ fn find_sidecar_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Res
                 archive_path, local_sidecar_dir, local_sidecar_exe
             ).into());
         }
+    }
+
+    if local_sidecar_exe.exists() {
+        return Ok((local_sidecar_exe, vec![], local_sidecar_dir));
+    }
+    if nested_local_exe.exists() {
+        let nested_dir = strip_windows_verbatim(&local_sidecar_dir.join("omnitome-sidecar"));
+        return Ok((nested_local_exe, vec![], nested_dir));
     }
 
     // 3. Pre-bundled sidecar executable (if pre-extracted in install_dir/resources or alongside exe)
@@ -528,6 +1388,13 @@ fn find_node_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Result
         }
     }
 
+    // 2. In release/packaged mode:
+    let app_data = strip_windows_verbatim(&get_app_data_dir());
+    let local_node_dir = strip_windows_verbatim(&app_data.join("node"));
+    let local_node_bin = strip_windows_verbatim(&local_node_dir.join("node.exe"));
+    let local_backend_dir = strip_windows_verbatim(&app_data.join("backend"));
+    let local_server_js = strip_windows_verbatim(&local_backend_dir.join("server.js"));
+
     let exe_path = strip_windows_verbatim(&std::env::current_exe()?);
     let install_dir = exe_path.parent().ok_or("Failed to get install dir")?;
     let install_dir = strip_windows_verbatim(install_dir);
@@ -536,6 +1403,35 @@ fn find_node_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Result
         return Err(format!("Installation directory resolves to root or empty: {:?}", install_dir).into());
     }
     eprintln!("[Supervisor] Found installation directory: {:?}", install_dir);
+
+    // Check for candidate archives
+    let mut candidate_node_archives = get_candidate_node_archives(&install_dir);
+    let mut candidate_backend_archives = get_candidate_backend_archives(&install_dir);
+    #[cfg(debug_assertions)]
+    {
+        candidate_node_archives.push(strip_windows_verbatim(&_project_root.join("resources").join("node.7z")));
+        candidate_node_archives.push(strip_windows_verbatim(&_project_root.join("..").join("resources").join("node.7z")));
+        candidate_backend_archives.push(strip_windows_verbatim(&_project_root.join("resources").join("backend.7z")));
+        candidate_backend_archives.push(strip_windows_verbatim(&_project_root.join("..").join("resources").join("backend.7z")));
+    }
+
+    for archive in &candidate_node_archives {
+        if archive.exists() {
+            unpack_managed_archive_7z(archive, &local_node_dir, "node.exe", false)?;
+            break;
+        }
+    }
+
+    for archive in &candidate_backend_archives {
+        if archive.exists() {
+            unpack_managed_archive_7z(archive, &local_backend_dir, "server.js", false)?;
+            break;
+        }
+    }
+
+    if local_node_bin.exists() && local_server_js.exists() {
+        return Ok((local_node_bin, vec![local_server_js.to_string_lossy().to_string()], local_backend_dir));
+    }
 
     if let Some(paths) = resolve_node_paths(&install_dir) {
         return Ok(paths);
@@ -547,8 +1443,8 @@ fn find_node_executable(_app: &tauri::AppHandle, _project_root: &Path) -> Result
     let alt_server = install_dir.join("backend").join("server.js");
 
     Err(format!(
-        "Could not find bundled Node.js or backend/server.js. Checked: node_bin={:?} (exists={}), server_js={:?} (exists={}), alt_node={:?} (exists={}), alt_server={:?} (exists={})",
-        node_bin, node_bin.exists(), server_js, server_js.exists(), alt_node, alt_node.exists(), alt_server, alt_server.exists()
+        "Could not find or unpack Node.js and backend/server.js. Checked: local_node={:?}, local_server={:?}, node_bin={:?}, server_js={:?}, alt_node={:?}, alt_server={:?}",
+        local_node_bin, local_server_js, node_bin, server_js, alt_node, alt_server
     ).into())
 }
 
@@ -1295,6 +2191,143 @@ mod tests {
     }
 
     #[test]
+    fn test_get_candidate_node_archives_strict_order() {
+        let install_dir = PathBuf::from(r"C:\Program Files\Omnitome");
+        let archives = get_candidate_node_archives(&install_dir);
+        assert_eq!(archives.len(), 2);
+        assert_eq!(archives[0], install_dir.join("resources").join("node.7z"));
+        assert_eq!(archives[1], install_dir.join("node.7z"));
+    }
+
+    #[test]
+    fn test_get_candidate_backend_archives_strict_order() {
+        let install_dir = PathBuf::from(r"C:\Program Files\Omnitome");
+        let archives = get_candidate_backend_archives(&install_dir);
+        assert_eq!(archives.len(), 2);
+        assert_eq!(archives[0], install_dir.join("resources").join("backend.7z"));
+        assert_eq!(archives[1], install_dir.join("backend.7z"));
+    }
+
+    #[test]
+    fn test_extraction_lock_acquire_and_drop() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_lock_acquire");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        {
+            let lock = ExtractionLock::acquire(&temp_dir, "test_resource").expect("lock acquire failed");
+            assert!(lock.lock_path.exists());
+            let content = fs::read_to_string(&lock.lock_path).unwrap();
+            assert_eq!(content.trim(), std::process::id().to_string());
+        }
+        // After drop, lock file must be cleaned up
+        assert!(!temp_dir.join(".test_resource.lock").exists());
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_unpack_managed_archive_7z_success_and_fast_path() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_unpack_managed");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let src_dir = temp_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("node.exe"), b"mock node content").unwrap();
+        fs::write(src_dir.join("readme.txt"), b"documentation").unwrap();
+
+        let archive_path = temp_dir.join("node.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_path).unwrap();
+        assert!(archive_path.exists());
+
+        let target_dir = temp_dir.join("node");
+        // 1. Initial unpack
+        let res = unpack_managed_archive_7z(&archive_path, &target_dir, "node.exe", false);
+        assert!(res.is_ok(), "initial unpack failed: {:?}", res.err());
+        assert!(target_dir.join("node.exe").exists());
+        assert!(target_dir.join("readme.txt").exists());
+
+        // 2. Fast-path check: calling again skips extraction instantly
+        let res2 = unpack_managed_archive_7z(&archive_path, &target_dir, "node.exe", false);
+        assert!(res2.is_ok(), "fast-path unpack failed: {:?}", res2.err());
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_unpack_managed_archive_7z_missing_expected_file_fails() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_unpack_missing_expected");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let src_dir = temp_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("other_file.txt"), b"not the expected file").unwrap();
+
+        let archive_path = temp_dir.join("package.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_path).unwrap();
+
+        let target_dir = temp_dir.join("output");
+        let res = unpack_managed_archive_7z(&archive_path, &target_dir, "expected_binary.exe", false);
+        assert!(res.is_err(), "unpacking without expected file must fail");
+        assert!(!target_dir.exists(), "target dir must not exist on failed validation");
+        assert!(!target_dir.with_extension("staging").exists(), "staging dir must be wiped");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_unpack_real_scratch_test_archives() {
+        let scratch_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("scratch");
+        let node_7z = scratch_dir.join("node.test.7z");
+        let backend_7z = scratch_dir.join("backend.test.7z");
+
+        if node_7z.exists() {
+            let temp_node = std::env::temp_dir().join("omnitome_test_unpack_real_node");
+            let _ = wipe_dir(&temp_node);
+            let res = unpack_managed_archive_7z(&node_7z, &temp_node, "node.exe", false);
+            assert!(res.is_ok(), "failed to unpack scratch/node.test.7z: {:?}", res.err());
+            assert!(temp_node.join("node.exe").exists(), "node.exe must exist in unpacked node archive");
+            let _ = wipe_dir(&temp_node);
+        }
+
+        if backend_7z.exists() {
+            let temp_backend = std::env::temp_dir().join("omnitome_test_unpack_real_backend");
+            let _ = wipe_dir(&temp_backend);
+            let res = unpack_managed_archive_7z(&backend_7z, &temp_backend, "server.js", false);
+            assert!(res.is_ok(), "failed to unpack scratch/backend.test.7z: {:?}", res.err());
+            assert!(temp_backend.join("server.js").exists(), "server.js must exist in unpacked backend archive");
+            assert!(temp_backend.join("node_modules").is_dir(), "node_modules must exist in unpacked backend archive");
+            let _ = wipe_dir(&temp_backend);
+        }
+    }
+
+    #[test]
+    fn test_validate_entry_name() {
+        // Safe entries
+        assert!(validate_entry_name("node.exe").is_ok());
+        assert!(validate_entry_name("sub/dir/server.js").is_ok());
+        assert!(validate_entry_name("node_modules/@tauri-apps/api/index.js").is_ok());
+
+        // Path traversal attempts
+        assert!(validate_entry_name("../evil.exe").is_err());
+        assert!(validate_entry_name("..\\evil.exe").is_err());
+        assert!(validate_entry_name("foo/../../bar.exe").is_err());
+        assert!(validate_entry_name("a/b/../c").is_err());
+
+        // Root path attempts
+        assert!(validate_entry_name("/root.exe").is_err());
+        assert!(validate_entry_name("\\root.exe").is_err());
+        assert!(validate_entry_name("/etc/passwd").is_err());
+
+        // Drive specifier attempts
+        assert!(validate_entry_name(r"C:\Windows\System32\cmd.exe").is_err());
+        assert!(validate_entry_name("d:malicious.dll").is_err());
+        assert!(validate_entry_name("D:/games").is_err());
+    }
+
+    #[test]
     fn test_get_candidate_sidecar_archives_strict_order() {
         let install_dir = PathBuf::from(r"C:\Program Files\Omnitome");
         let archives = get_candidate_sidecar_archives(&install_dir);
@@ -1355,5 +2388,576 @@ mod tests {
         assert!(content.contains("Unpacking neural engine..."));
         assert!(content.contains("First launch may take 1-2 minutes."));
     }
-}
 
+    #[test]
+    fn test_validate_entry_name_windows_dos_devices() {
+        let reserved = [
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+
+        for dev in &reserved {
+            // Direct device name
+            assert!(validate_entry_name(dev).is_err(), "Device {} should be rejected", dev);
+            // Lowercase
+            assert!(validate_entry_name(&dev.to_lowercase()).is_err(), "Lowercase {} should be rejected", dev);
+            // With extension
+            let with_ext = format!("{}.txt", dev);
+            assert!(validate_entry_name(&with_ext).is_err(), "{} should be rejected", with_ext);
+            let with_js = format!("{}.js", dev.to_lowercase());
+            assert!(validate_entry_name(&with_js).is_err(), "{} should be rejected", with_js);
+            // Nested in subdirectories
+            let nested = format!("sub/dir/{}", dev);
+            assert!(validate_entry_name(&nested).is_err(), "{} should be rejected", nested);
+            let nested_ext = format!("node_modules/{}.exe", dev);
+            assert!(validate_entry_name(&nested_ext).is_err(), "{} should be rejected", nested_ext);
+        }
+
+        // Permitted legitimate names that contain similar substrings
+        assert!(validate_entry_name("contact.txt").is_ok());
+        assert!(validate_entry_name("auxiliary.js").is_ok());
+        assert!(validate_entry_name("sub/nursery.png").is_ok());
+        assert!(validate_entry_name("computer.dll").is_ok());
+    }
+
+    #[test]
+    fn test_validate_entry_name_ads_colons() {
+        assert!(validate_entry_name("server.js:stream").is_err());
+        assert!(validate_entry_name("file.txt::$DATA").is_err());
+        assert!(validate_entry_name("sub/module.js:hidden").is_err());
+        assert!(validate_entry_name("C:payload.exe").is_err());
+        assert!(validate_entry_name(":colon_start").is_err());
+    }
+
+    #[test]
+    fn test_validate_entry_name_trailing_dots_and_spaces() {
+        assert!(validate_entry_name("file.txt.").is_err());
+        assert!(validate_entry_name("file.txt ").is_err());
+        assert!(validate_entry_name("sub./file.txt").is_err());
+        assert!(validate_entry_name("sub /file.txt").is_err());
+        assert!(validate_entry_name(" sub/file.txt").is_err());
+        assert!(validate_entry_name("sub//file.txt").is_err());
+        assert!(validate_entry_name("sub/./file.txt").is_err());
+    }
+
+    #[test]
+    fn test_validate_entry_attributes_reparse_point_and_symlinks() {
+        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+        entry.name = "symlink_test".to_string();
+
+        // 1. Normal file attributes pass
+        entry.has_windows_attributes = true;
+        entry.windows_attributes = 0x20; // FILE_ATTRIBUTE_ARCHIVE
+        assert!(validate_entry_attributes(&entry).is_ok());
+
+        // 2. Windows Reparse Point (0x400) rejected
+        entry.windows_attributes = 0x00000420; // Reparse point + Archive
+        let res = validate_entry_attributes(&entry);
+        assert!(res.is_err(), "Reparse point must be rejected");
+        assert!(res.unwrap_err().to_string().contains("reparse point"));
+
+        // 3. POSIX symlink (0o120000 << 16 = 0xA0000000) rejected
+        entry.windows_attributes = 0xA1ED0020;
+        let res_posix = validate_entry_attributes(&entry);
+        assert!(res_posix.is_err(), "POSIX symlink must be rejected");
+        assert!(res_posix.unwrap_err().to_string().contains("POSIX symlink"));
+    }
+
+    #[test]
+    fn test_compute_sha256_known_nist_vectors() {
+        assert_eq!(
+            compute_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            compute_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_archive_resource_limits_rejection() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_limits_rejection");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let src_dir = temp_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("f1.txt"), vec![b'A'; 2000]).unwrap();
+        fs::write(src_dir.join("f2.txt"), vec![b'B'; 2000]).unwrap();
+        fs::write(src_dir.join("f3.txt"), vec![b'C'; 2000]).unwrap();
+
+        let archive_path = temp_dir.join("test_limits.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_path).unwrap();
+
+        // 1. Max entries rejection
+        let tight_entries = ArchiveLimits {
+            max_entries: 2,
+            max_uncompressed_bytes: 100_000,
+            max_single_file_bytes: 100_000,
+        };
+        let res_entries = validate_archive_entries(&archive_path, tight_entries);
+        assert!(res_entries.is_err(), "Should reject when entry count exceeds limit");
+        assert!(res_entries.unwrap_err().to_string().contains("exceeding maximum permitted limit of 2"));
+
+        // 2. Max uncompressed size rejection
+        let tight_bytes = ArchiveLimits {
+            max_entries: 50,
+            max_uncompressed_bytes: 3_000,
+            max_single_file_bytes: 100_000,
+        };
+        let res_bytes = validate_archive_entries(&archive_path, tight_bytes);
+        assert!(res_bytes.is_err(), "Should reject when uncompressed size exceeds limit");
+        assert!(res_bytes.unwrap_err().to_string().contains("total uncompressed size exceeds"));
+
+        // 3. Max single file size rejection
+        let tight_single = ArchiveLimits {
+            max_entries: 50,
+            max_uncompressed_bytes: 100_000,
+            max_single_file_bytes: 1_000,
+        };
+        let res_single = validate_archive_entries(&archive_path, tight_single);
+        assert!(res_single.is_err(), "Should reject when single file exceeds limit");
+        assert!(res_single.unwrap_err().to_string().contains("exceeding maximum single file limit"));
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_extraction_lock_timeout_and_concurrency() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_lock_timeout");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let lock1 = ExtractionLock::acquire_with_timeout(&temp_dir, "shared_res", Duration::from_secs(5))
+            .expect("First acquire should succeed");
+
+        // Concurrent acquire from a separate thread must time out (Win32 Mutex is re-entrant on same thread, exclusive across threads)
+        let t_dir = temp_dir.clone();
+        let handle = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let res = ExtractionLock::acquire_with_timeout(&t_dir, "shared_res", Duration::from_millis(150));
+            (res.is_err(), start.elapsed())
+        });
+
+        let (timed_out, elapsed) = handle.join().unwrap();
+        assert!(timed_out, "Concurrent acquire from another thread must time out");
+        assert!(elapsed >= Duration::from_millis(100), "Should wait for timeout duration");
+
+        // Drop first lock; subsequent acquire from another thread should succeed immediately
+        drop(lock1);
+
+        let t_dir2 = temp_dir.clone();
+        let handle2 = thread::spawn(move || {
+            ExtractionLock::acquire_with_timeout(&t_dir2, "shared_res", Duration::from_secs(2)).is_ok()
+        });
+        assert!(handle2.join().unwrap(), "Acquire after release should succeed");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_extraction_lock_abandoned_mutex_recovery() {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let temp_dir = std::env::temp_dir().join("omnitome_test_lock_abandoned");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mutex_name = compute_mutex_name(&temp_dir, "test_abandon");
+        let mutex_name_clone = mutex_name.clone();
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn ExitThread(dwExitCode: u32) -> !;
+            fn CreateMutexW(lpMutexAttributes: *mut std::ffi::c_void, bInitialOwner: i32, lpName: *const u16) -> *mut std::ffi::c_void;
+            fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+        }
+
+        // Spawn a thread that acquires the raw Win32 mutex and exits abnormally without releasing it
+        let _ = thread::spawn(move || {
+            let name_wide: Vec<u16> = OsStr::new(&mutex_name_clone).encode_wide().chain(Some(0)).collect();
+            let raw_mutex = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name_wide.as_ptr()) };
+            assert!(!raw_mutex.is_null());
+            let wait_res = unsafe { WaitForSingleObject(raw_mutex, 2000) };
+            assert_eq!(wait_res, 0); // WAIT_OBJECT_0
+            // Terminate thread abnormally without ReleaseMutex
+            unsafe { ExitThread(0); }
+        });
+
+        // Give the OS thread time to terminate and abandon the mutex
+        thread::sleep(Duration::from_millis(200));
+
+        // Main thread acquires: Windows kernel must report WAIT_ABANDONED and award ownership safely
+        let lock = ExtractionLock::acquire_with_timeout(&temp_dir, "test_abandon", Duration::from_secs(2))
+            .expect("Should acquire abandoned mutex without deadlock or stale lock failure");
+        assert!(lock.was_abandoned, "Should flag that the mutex was abandoned by dead owner");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_promote_staging_dir_success_and_rollback() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_promote_rollback");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_dir = temp_dir.join("runtime");
+        let staging_dir = temp_dir.join("runtime.staging");
+        let backup_dir = temp_dir.join("runtime.backup");
+
+        // 1. Initial promote
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("version.txt"), b"v1").unwrap();
+        promote_staging_dir(&staging_dir, &target_dir).unwrap();
+        assert!(target_dir.join("version.txt").exists());
+        assert_eq!(fs::read_to_string(target_dir.join("version.txt")).unwrap(), "v1");
+        assert!(!staging_dir.exists());
+        assert!(!backup_dir.exists());
+
+        // 2. Successful update promote
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("version.txt"), b"v2").unwrap();
+        promote_staging_dir(&staging_dir, &target_dir).unwrap();
+        assert_eq!(fs::read_to_string(target_dir.join("version.txt")).unwrap(), "v2");
+        assert!(!backup_dir.exists());
+
+        // 3. Rollback simulation: if staging cannot be renamed, target v2 must be preserved
+        // We simulate this by having target exist, but staging_dir does NOT exist
+        let non_existent_staging = temp_dir.join("runtime.staging_ghost");
+        let promote_err = promote_staging_dir(&non_existent_staging, &target_dir);
+        assert!(promote_err.is_err(), "Promoting non-existent staging must fail");
+        // Target must remain intact with v2 content via rollback
+        assert!(target_dir.join("version.txt").exists(), "Target must be restored after rollback");
+        assert_eq!(fs::read_to_string(target_dir.join("version.txt")).unwrap(), "v2");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_startup_recovery_interrupted_rotations() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_startup_recovery");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_dir = temp_dir.join("runtime");
+        let backup_dir = temp_dir.join("runtime.backup");
+        let staging_dir = temp_dir.join("runtime.staging");
+
+        // Case A: target missing, backup has valid runtime, partial staging present
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("server.js"), b"working server v1").unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("partial.tmp"), b"incomplete").unwrap();
+
+        recover_interrupted_rotations(&target_dir, "server.js");
+
+        assert!(target_dir.join("server.js").exists(), "Target directory must be restored from backup");
+        assert_eq!(fs::read_to_string(target_dir.join("server.js")).unwrap(), "working server v1");
+        assert!(!backup_dir.exists(), "Backup directory should have been rotated to target");
+        assert!(!staging_dir.exists(), "Partial staging directory must be swept");
+
+        // Case B: target exists, leftover backup present
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("old.txt"), b"stale").unwrap();
+
+        recover_interrupted_rotations(&target_dir, "server.js");
+
+        assert!(target_dir.join("server.js").exists(), "Target directory must remain intact");
+        assert!(!backup_dir.exists(), "Leftover backup directory must be wiped");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_manifest_generation_update_detection_and_stub_rejection() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_manifest_lifecycle");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Initial extraction of v1 archive
+        let src_v1 = temp_dir.join("src_v1");
+        fs::create_dir_all(&src_v1).unwrap();
+        fs::write(src_v1.join("node.exe"), b"node binary version 1.0").unwrap();
+        fs::write(src_v1.join("package.json"), b"{\"name\": \"omnitome\"}").unwrap();
+
+        let archive_v1 = temp_dir.join("node_v1.7z");
+        sevenz_rust::compress_to_path(&src_v1, &archive_v1).unwrap();
+
+        let target_dir = temp_dir.join("node");
+        unpack_managed_archive_7z(&archive_v1, &target_dir, "node.exe", false).expect("Unpack v1 failed");
+
+        // Manifest must exist and be valid
+        let manifest_path = target_dir.join(".extraction_manifest.json");
+        assert!(manifest_path.exists(), "Manifest must be written upon extraction");
+        assert!(is_manifest_valid(&target_dir, &archive_v1, "node.exe"));
+
+        // Fast path skips instantly
+        assert!(unpack_managed_archive_7z(&archive_v1, &target_dir, "node.exe", false).is_ok());
+
+        // 2. Update detection: archive changes to v2
+        let src_v2 = temp_dir.join("src_v2");
+        fs::create_dir_all(&src_v2).unwrap();
+        fs::write(src_v2.join("node.exe"), b"node binary version 2.0 UPDATED").unwrap();
+        fs::write(src_v2.join("package.json"), b"{\"name\": \"omnitome-v2\"}").unwrap();
+
+        let archive_v2 = temp_dir.join("node_v2.7z");
+        sevenz_rust::compress_to_path(&src_v2, &archive_v2).unwrap();
+
+        // Calling unpack with updated archive must detect hash mismatch and promote v2
+        assert!(!is_manifest_valid(&target_dir, &archive_v2, "node.exe"), "Must detect archive hash mismatch");
+        unpack_managed_archive_7z(&archive_v2, &target_dir, "node.exe", false).expect("Unpack v2 failed");
+
+        assert_eq!(
+            fs::read_to_string(target_dir.join("node.exe")).unwrap(),
+            "node binary version 2.0 UPDATED",
+            "Target runtime must be updated to v2"
+        );
+        assert!(is_manifest_valid(&target_dir, &archive_v2, "node.exe"));
+
+        // 3. Stub file rejection: truncate critical binary to 0 bytes
+        fs::write(target_dir.join("node.exe"), b"").unwrap();
+        assert_eq!(fs::metadata(target_dir.join("node.exe")).unwrap().len(), 0);
+        assert!(!is_manifest_valid(&target_dir, &archive_v2, "node.exe"), "0-byte stub must invalidate manifest");
+
+        // Unpack heals the truncated binary
+        unpack_managed_archive_7z(&archive_v2, &target_dir, "node.exe", false).expect("Re-unpack failed");
+        assert!(fs::metadata(target_dir.join("node.exe")).unwrap().len() > 0, "Binary must be rehealed");
+
+        // 4. Corrupted JSON manifest rejection
+        fs::write(&manifest_path, b"{ broken json").unwrap();
+        assert!(!is_manifest_valid(&target_dir, &archive_v2, "node.exe"), "Corrupted JSON must invalidate manifest");
+
+        // Unpack heals the corrupted manifest
+        unpack_managed_archive_7z(&archive_v2, &target_dir, "node.exe", false).expect("Re-unpack failed");
+        assert!(is_manifest_valid(&target_dir, &archive_v2, "node.exe"), "Manifest must be regenerated");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_validate_production_and_scratch_archives_unmodified() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.parent().unwrap();
+        let scratch_dir = root.join("scratch");
+        let resources_dir = root.join("resources");
+
+        let node_7z = scratch_dir.join("node.test.7z");
+        let backend_7z = scratch_dir.join("backend.test.7z");
+        let sidecar_7z = resources_dir.join("sidecar.7z");
+
+        // Validate scratch node archive
+        if node_7z.exists() {
+            let meta_before = fs::metadata(&node_7z).unwrap();
+            let res = validate_archive_entries(&node_7z, ArchiveLimits::node());
+            assert!(res.is_ok(), "node.test.7z validation failed: {:?}", res.err());
+            let meta_after = fs::metadata(&node_7z).unwrap();
+            assert_eq!(meta_before.len(), meta_after.len(), "node.test.7z size modified!");
+        }
+
+        // Validate scratch backend archive
+        if backend_7z.exists() {
+            let meta_before = fs::metadata(&backend_7z).unwrap();
+            let res = validate_archive_entries(&backend_7z, ArchiveLimits::backend());
+            assert!(res.is_ok(), "backend.test.7z validation failed: {:?}", res.err());
+            let meta_after = fs::metadata(&backend_7z).unwrap();
+            assert_eq!(meta_before.len(), meta_after.len(), "backend.test.7z size modified!");
+        }
+
+        // Validate production sidecar archive structure and limits without modifying it
+        if sidecar_7z.exists() {
+            let meta_before = fs::metadata(&sidecar_7z).unwrap();
+            let res = validate_archive_entries(&sidecar_7z, ArchiveLimits::sidecar());
+            assert!(res.is_ok(), "resources/sidecar.7z validation failed: {:?}", res.err());
+            let meta_after = fs::metadata(&sidecar_7z).unwrap();
+            assert_eq!(meta_before.len(), meta_after.len(), "sidecar.7z size modified!");
+        }
+    }
+
+    #[test]
+    fn test_recover_interrupted_rotations_preserves_valid_backup_when_target_is_empty_or_broken() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_recovery_broken_target");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_dir = temp_dir.join("runtime");
+        let backup_dir = temp_dir.join("runtime.backup");
+        let staging_dir = temp_dir.join("runtime.staging");
+
+        // Simulate interrupted promotion where target exists but has missing or broken binary,
+        // and backup_dir holds the last valid runtime.
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("corrupted.tmp"), b"partial broken data").unwrap();
+
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("node.exe"), b"valid working node binary").unwrap();
+
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("partial.7z"), b"partial").unwrap();
+
+        recover_interrupted_rotations(&target_dir, "node.exe");
+
+        // The supervisor MUST NOT wipe backup; it must restore backup -> target!
+        assert!(target_dir.join("node.exe").exists(), "Valid runtime must be restored to target");
+        assert_eq!(
+            fs::read_to_string(target_dir.join("node.exe")).unwrap(),
+            "valid working node binary",
+            "Restored runtime content must match the backup"
+        );
+        assert!(!backup_dir.exists(), "Backup directory should have been rotated to target");
+        assert!(!staging_dir.exists(), "Leftover staging artifacts must be purged");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_extraction_lock_case_and_slash_normalization() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_lock_case_norm");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Path representation 1: standard backslashes
+        let p1 = temp_dir.clone();
+        // Path representation 2: forward slashes, upper/lowercase variations
+        let p2_str = temp_dir.to_string_lossy().replace('\\', "/").to_uppercase();
+        let p2 = PathBuf::from(p2_str);
+
+        let lock1 = ExtractionLock::acquire_with_timeout(&p1, "norm_test", Duration::from_secs(5))
+            .expect("First acquire with path 1 should succeed");
+
+        // Concurrent acquire on p2 (different casing and slashes, same folder) from another thread MUST time out
+        let handle = thread::spawn(move || {
+            ExtractionLock::acquire_with_timeout(&p2, "NORM_TEST", Duration::from_millis(150)).is_err()
+        });
+
+        let timed_out = handle.join().unwrap();
+        assert!(timed_out, "Lock on normalized path variation must be recognized as held and time out");
+
+        drop(lock1);
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_validate_entry_name_forbidden_windows_chars_and_clock() {
+        // Forbidden Win32 characters: < > " | ? * and control chars
+        let forbidden = ["file<1>.txt", "pipe|cmd.js", "wild*card.dll", "test?mark.dat", "quote\"file.json"];
+        for name in &forbidden {
+            assert!(validate_entry_name(name).is_err(), "{:?} should be rejected", name);
+        }
+
+        // Control characters
+        assert!(validate_entry_name("bad\x01file.txt").is_err());
+        assert!(validate_entry_name("bad\x1Ffile.txt").is_err());
+
+        // CLOCK$ device name
+        assert!(validate_entry_name("CLOCK$").is_err());
+        assert!(validate_entry_name("clock$").is_err());
+        assert!(validate_entry_name("clock$.txt").is_err());
+        assert!(validate_entry_name("sub/dir/clock$").is_err());
+    }
+
+    #[test]
+    fn test_manifest_rejects_archive_name_mismatch() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_manifest_archive_mismatch");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let src_dir = temp_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("node.exe"), b"mock node").unwrap();
+
+        let archive_node = temp_dir.join("node.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_node).unwrap();
+
+        let target_dir = temp_dir.join("node");
+        unpack_managed_archive_7z(&archive_node, &target_dir, "node.exe", false).expect("Unpack node failed");
+        assert!(is_manifest_valid(&target_dir, &archive_node, "node.exe"));
+
+        // If someone passes a different archive path (e.g. backend.7z) against this target directory,
+        // it must reject the fast-path due to archive name mismatch
+        let archive_backend = temp_dir.join("backend.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_backend).unwrap();
+
+        assert!(
+            !is_manifest_valid(&target_dir, &archive_backend, "node.exe"),
+            "Manifest created for node.7z must NOT validate for backend.7z"
+        );
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_decompression_in_flight_stream_size_limit_rejection() {
+        let temp_dir = std::env::temp_dir().join("omnitome_test_stream_limits");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let src_dir = temp_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("large_file.dat"), vec![b'X'; 50_000]).unwrap();
+
+        let archive_path = temp_dir.join("payload.7z");
+        sevenz_rust::compress_to_path(&src_dir, &archive_path).unwrap();
+
+        let tight_single_limit = ArchiveLimits {
+            max_entries: 100,
+            max_uncompressed_bytes: 1_000_000,
+            max_single_file_bytes: 10_000, // 10 KB limit vs 50 KB file
+        };
+
+        // Header check catches declared size
+        assert!(validate_archive_entries(&archive_path, tight_single_limit).is_err());
+
+        let _ = wipe_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_extraction_lock_cross_process_mutual_exclusion() {
+        if std::env::var("OMNITOME_TEST_LOCK_CHILD").is_ok() {
+            let lock_dir = PathBuf::from(std::env::var("OMNITOME_CHILD_LOCK_DIR").unwrap());
+            let timeout_ms: u64 = std::env::var("OMNITOME_CHILD_TIMEOUT_MS").unwrap().parse().unwrap();
+            let res = ExtractionLock::acquire_with_timeout(&lock_dir, "proc_lock", Duration::from_millis(timeout_ms));
+            if res.is_ok() {
+                std::process::exit(0);
+            } else {
+                std::process::exit(42);
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join("omnitome_test_lock_cross_proc");
+        let _ = wipe_dir(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let lock1 = ExtractionLock::acquire_with_timeout(&temp_dir, "proc_lock", Duration::from_secs(5))
+            .expect("Parent should acquire lock");
+
+        let current_exe = std::env::current_exe().expect("current_exe failed");
+
+        // Spawn child process while parent holds lock (short timeout 150ms -> must fail with code 42)
+        let status1 = Command::new(&current_exe)
+            .args(["--exact", "tests::test_extraction_lock_cross_process_mutual_exclusion"])
+            .env("OMNITOME_TEST_LOCK_CHILD", "1")
+            .env("OMNITOME_CHILD_LOCK_DIR", temp_dir.to_string_lossy().to_string())
+            .env("OMNITOME_CHILD_TIMEOUT_MS", "150")
+            .status()
+            .expect("Failed to execute child process");
+        assert_eq!(status1.code(), Some(42), "Child process should fail to acquire lock while parent holds it");
+
+        // Drop parent lock; child process with longer timeout must succeed (code 0)
+        drop(lock1);
+
+        let status2 = Command::new(&current_exe)
+            .args(["--exact", "tests::test_extraction_lock_cross_process_mutual_exclusion"])
+            .env("OMNITOME_TEST_LOCK_CHILD", "1")
+            .env("OMNITOME_CHILD_LOCK_DIR", temp_dir.to_string_lossy().to_string())
+            .env("OMNITOME_CHILD_TIMEOUT_MS", "3000")
+            .status()
+            .expect("Failed to execute child process");
+        assert_eq!(status2.code(), Some(0), "Child process should acquire lock after parent released it");
+
+        let _ = wipe_dir(&temp_dir);
+    }
+}

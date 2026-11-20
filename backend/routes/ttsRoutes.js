@@ -8,11 +8,27 @@
 'use strict';
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
+const path = require('node:path');
 const router = express.Router();
 const ttsClient = require('../services/ai/ttsClient');
 
 const HASH_REGEX = /^[a-f0-9]{64}$/;
+
+// Generous rate limiter for audio file access (CWE-770 mitigation)
+// Allows up to 1,000 audio chunk requests per minute so local speech narration
+// is never throttled while guarding disk reads against resource exhaustion.
+const audioRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many audio requests from this IP, please try again after a minute.',
+    code: 'RATE_LIMIT_EXCEEDED',
+  },
+});
 
 /**
  * POST /api/tts/synthesize
@@ -51,7 +67,7 @@ router.post('/synthesize', async (req, res, next) => {
  * Query: ?voice=af_heart
  * Serves 24kHz 16-bit mono WAV file with static cache headers.
  */
-router.get('/audio/:hash', (req, res) => {
+router.get('/audio/:hash', audioRateLimiter, (req, res) => {
   const { hash } = req.params;
   if (!hash || !HASH_REGEX.test(hash)) {
     return res.status(400).json({
@@ -62,19 +78,43 @@ router.get('/audio/:hash', (req, res) => {
 
   const voice = req.query.voice || 'af_heart';
   const { filePath } = ttsClient.resolveAudioPath(hash, voice);
+  const resolvedPath = path.resolve(filePath);
+  const resolvedBase = path.resolve(ttsClient.TTS_CACHE_DIR);
 
-  if (!fs.existsSync(filePath)) {
+  // Path containment & traversal defense
+  if (!resolvedPath.startsWith(resolvedBase + path.sep)) {
+    return res.status(403).json({
+      error: 'Access denied: audio file path is outside cache directory.',
+      code: 'FORBIDDEN_PATH',
+    });
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
     return res.status(404).json({
       error: 'Audio file not found in cache.',
       code: 'AUDIO_NOT_FOUND',
     });
   }
 
+  // Symlink resolution containment check
+  try {
+    const realPath = fs.realpathSync(resolvedPath);
+    const realBase = fs.realpathSync(resolvedBase);
+    if (!realPath.startsWith(realBase + path.sep)) {
+      return res.status(403).json({
+        error: 'Access denied: resolved audio symlink escapes cache boundary.',
+        code: 'FORBIDDEN_SYMLINK',
+      });
+    }
+  } catch {
+    // If realpathSync fails on race condition, 404 handler or Express sendFile handles it
+  }
+
   res.set('Content-Type', 'audio/wav');
   res.set('Accept-Ranges', 'bytes');
   res.set('Cache-Control', 'public, max-age=31536000, immutable');
 
-  return res.sendFile(filePath);
+  return res.sendFile(resolvedPath);
 });
 
 /**

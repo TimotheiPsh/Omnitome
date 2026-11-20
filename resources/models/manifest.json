@@ -1,0 +1,49 @@
+{
+  "manifest_version": "1.0.0",
+  "comment": "Authoritative Git LFS Checkpoint Hashes anchored to upstream Hugging Face repositories",
+  "repositories": {
+    "hexgrad/Kokoro-82M": {
+      "commit": "f38b4a70be6c84c7a6e1160d5b59779df5c49045",
+      "files": {
+        "kokoro-v1_0.pth": {
+          "sha256": "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4",
+          "size": 327212226
+        },
+        "voices/af_heart.pt": {
+          "sha256": "0ab5709b8ffab19bfd849cd11d98f75b60af7733253ad0d67b12382a102cb4ff",
+          "size": 523425
+        },
+        "voices/am_adam.pt": {
+          "sha256": "ced7e284aba12472891be1da3ab34db84cc05cc02b5889535796dbf2d8b0cb34",
+          "size": 523420
+        },
+        "voices/bf_alice.pt": {
+          "sha256": "d292651b6af6c0d81705c2580dcb4463fccc0ff7b8d618a471dbb4e45655b3f3",
+          "size": 523425
+        },
+        "voices/bm_george.pt": {
+          "sha256": "f1bc812213dc59774769e5c80004b13eeb79bd78130b11b2d7f934542dab811b",
+          "size": 523430
+        }
+      }
+    },
+    "BAAI/bge-m3": {
+      "commit": "5617a9f61b028005a4858fdac845db406aefb181",
+      "files": {
+        "pytorch_model.bin": {
+          "sha256": "b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38",
+          "size": 2271145830
+        }
+      }
+    },
+    "BAAI/bge-reranker-v2-m3": {
+      "commit": "33b497063462f689f5ff983058866cf17f7cf09a",
+      "files": {
+        "model.safetensors": {
+          "sha256": "d9e3e081faff1eefb84019509b2f5558fd74c1a05a2c7db22f74174fcedb5286",
+          "size": 2271071852
+        }
+      }
+    }
+  }
+}

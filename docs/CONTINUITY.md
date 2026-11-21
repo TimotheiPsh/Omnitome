@@ -29,11 +29,11 @@
 - Auto-minimizing import drawer with monotonic progress tracking and hover immunity
 
 **Current milestone & immediate focus:**
-- **v1.1.0 Released:** Desktop packaging, Kokoro TTS integration, onboarding wizard, synthetic archive, and bug bash complete.
+- **v1.1.2 Released:** PyTorch 2.13 + CUDA 12.6 upgrade, Path A managed 7z extraction (326 MB NSIS headroom), single-instance Win32 kernel mutex, 100% CodeQL/Dependabot triage, and enterprise `SECURITY.md`.
 - **Next Action Items (v1.2+ Roadmap):**
-  1. **F55 — Domain-Aware Structure Engine:** Content-adaptive TOC extraction for papers, legal briefs, technical docs, and prose.
-  2. **Cross-Platform Packaging (macOS / Linux):** Sidecar recipes for Linux AppImage / deb and macOS Universal binary.
-  3. **Windows Code Signing:** Configure EV certificate for SmartScreen trust.
+  1. **Zero-Cost Storefront Rollout ($0 Fee):** Submit manifest to Microsoft WinGet (`winget install omnitome`), publish to Itch.io storefront (Pay-What-You-Want / Free), and list on AlternativeTo.net.
+  2. **Cross-Platform macOS Port:** Implement PyTorch Metal (`mps`) unified memory routing, POSIX supervisor process groups (`killpg`), and automated CI `.dmg` builds on GitHub Actions `macos-14` (Apple Silicon M1) runners (Homebrew Cask distribution).
+  3. **F55 — Domain-Aware Structure Engine:** Content-adaptive TOC extraction for papers, legal briefs, technical docs, and prose.
 
 ## How we work
 

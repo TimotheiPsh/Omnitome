@@ -33,7 +33,28 @@ Commercial and Store editions monetize **turnkey convenience, certified OS distr
   - Pre-cached local neural model weights requiring zero first-launch download latency.
 - **Distribution & Pricing:** One-time purchase ($19–$29 perpetual license) via Microsoft Store, Steam, or direct merchant platform (Lemon Squeezy / Stripe).
 
-### 1.3 Enterprise & OEM Commercial Licensing
+### 1.3 Zero-Cost ($0 Upfront Fee) App Store & Distribution Channels
+To maximize reach and establish legitimate distribution without incurring pay-to-play store fees (e.g., Steam's $100 submission fee or Apple's $99/year developer fee), Omnitome leverages reputable, high-visibility zero-cost channels:
+
+1. **WinGet (Windows Package Manager Community Repository) — $0 Fee:**
+   - Pre-installed natively on Windows 10 & 11.
+   - Users install via: `winget install omnitome`.
+   - Submission is 100% free via `wingetcreate` CLI against GitHub repository `microsoft/winget-pkgs`, pulling directly from GitHub Releases (`Omnitome_1.1.2_x64-setup.exe`).
+   - Automatically tested in Microsoft CI sandboxes and merged into the official Windows catalog.
+2. **Itch.io Independent Software Store — $0 Fee:**
+   - Dedicated desktop store and launcher ecosystem supporting tools, books, and creative AI software.
+   - Allows fully customized storefront styling matching Omnitome themes, video showcases, and screenshots.
+   - Flexible pricing: set to "Free / Pay what you want" (enabling voluntary tips/donations with zero listing fees).
+3. **Scoop & Chocolatey CLI Repositories — $0 Fee:**
+   - Trusted package managers for developers, sysadmins, and power users.
+   - `scoop install omnitome` via community bucket or custom GitHub tap.
+4. **AlternativeTo.net & Software Discovery Platforms — $0 Fee:**
+   - Direct editorial submission positioning Omnitome as a local-first, privacy-preserving alternative to *Readwise Reader*, *Calibre*, *Obsidian*, and *Adobe Acrobat Reader*.
+5. **Homebrew Cask (for macOS) — $0 Fee:**
+   - The undisputed standard package manager for Mac developers and power users (`brew install --cask omnitome`).
+   - Submission via standard GitHub pull request to `homebrew/homebrew-cask`.
+
+### 1.4 Enterprise & OEM Commercial Licensing
 - **Target Audience:** Legal firms, medical research teams, defense contractors, and corporate intranet knowledge bases with strict compliance policies prohibiting AGPL-3.0 copyleft integration.
 - **Licensing Pathway:** Dual-licensing model via the private upstream repository (`Omnitome-Private`), granting commercial proprietary rights, OEM bundling rights, private-cloud deployment rights, and priority engineering SLAs.
 
@@ -89,9 +110,9 @@ Omnitome solves this via the **5-Step Welcome Wizard** (`frontend/src/components
 | Milestone | Scope & Deliverables | Status |
 | :--- | :--- | :---: |
 | **Phase 1 (v1.0.x)** | Standalone Tauri v2 desktop shell, 2GB NSIS ceiling overcome via LZMA `sidecar.7z`, PyInstaller PyTorch FP16 CUDA/cuDNN bundling, offline Kokoro-82M TTS, SQLite WAL single-writer architecture, and 60 backend unit test suites. | **COMPLETED & SHIPPED** |
-| **Phase 2 (v1.1.0)** | 5-Step Welcome Wizard, 90-stem procedural Web Audio engine with narration ducking, 6-volume Synthetic Archive Starter Pack with ground truth evaluation suites, 4-layer author attribution defense, GitHub Sponsors integration, and Oct 24 playtest bug bash resolution. | **COMPLETED & SHIPPED** |
-| **Phase 3 (v1.2+)** | **F55 Domain-Aware Structure Engine:** Content-adaptive TOC extraction for legal briefs, scientific papers, and dense technical specifications. Windows Authenticode EV Code Signing for seamless installation. Cross-platform sidecar packaging (macOS Universal and Linux AppImage). | **CURRENT ROADMAP** |
-| **Phase 4 (v2.0)** | Microsoft Store & Steam publishing. Enterprise dual-licensing distribution. Native multi-speaker voice cloning and conversational discussion mode over research dossiers. | **PLANNED** |
+| **Phase 2 (v1.1.0 – v1.1.2)** | 5-Step Welcome Wizard, 90-stem Web Audio engine, 6-volume Synthetic Archive, PyTorch 2.13 + CUDA 12.6 upgrade (CVE remediation), Path A managed archive extraction (326 MB headroom under NSIS ceiling), single-instance Win32 mutex, and 100% CodeQL/Dependabot triage. | **COMPLETED & SHIPPED** |
+| **Phase 3 (v1.2+)** | **Zero-Cost Storefront Rollout:** Launch on Microsoft WinGet (`winget install omnitome`), Itch.io standalone storefront, and Scoop/Chocolatey. **F55 Domain-Aware Structure Engine:** Content-adaptive TOC extraction for legal briefs and scientific papers. | **CURRENT ROADMAP** |
+| **Phase 4 (macOS Port)** | **Apple Silicon & Unified Memory Migration:** PyTorch Metal Performance Shaders (`mps`) routing, POSIX supervisor process groups (`killpg`), `flock` single-instance synchronization, and cloud-free compilation via GitHub Actions `macos-14` runners (`.dmg` distribution via Homebrew Cask). | **PLANNED** |
 
 ---
 
